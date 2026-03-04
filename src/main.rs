@@ -24,6 +24,24 @@ enum Command {
     Server,
     /// List pending/in-flight requests
     List,
+    /// Cancel a pending request
+    Cancel {
+        /// The request ID to cancel
+        #[facet(args::positional)]
+        request_id: String,
+    },
+    /// Nudge the buddy handling a request
+    Nudge {
+        /// The request ID to nudge
+        #[facet(args::positional)]
+        request_id: String,
+    },
+    /// Retry a request by reassigning it with a new ID
+    Retry {
+        /// The request ID to retry
+        #[facet(args::positional)]
+        request_id: String,
+    },
     /// Assign a task to another agent (reads from stdin)
     Assign {
         /// Keep the worker's existing context (default: clear it)
@@ -47,6 +65,9 @@ USAGE:
     bud                              Show this manual
     bud server                       Start the server (usually auto-started)
     bud list                         List pending/in-flight requests
+    bud cancel <id>                  Cancel a pending request
+    bud nudge <id>                   Remind buddy about a pending request
+    bud retry <id>                   Reassign a request with a new ID
     cat <<'EOF' | bud assign                 Assign a task (clears worker context)
     cat <<'EOF' | bud assign --keep          Assign, keeping worker's context
     cat <<'EOF' | bud assign --title "..."   Assign with a title
@@ -119,6 +140,9 @@ async fn main() -> Result<()> {
                 .await
         }
         Some(Command::List) => list_requests(),
+        Some(Command::Cancel { request_id }) => cancel_request(&request_id),
+        Some(Command::Nudge { request_id }) => nudge_request(&request_id),
+        Some(Command::Retry { request_id }) => retry_request(&request_id).await,
         Some(Command::Assign { keep, title }) => {
             let pane = std::env::var("TMUX_PANE")
                 .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
@@ -127,11 +151,7 @@ async fn main() -> Result<()> {
             client_assign(pane, content, !keep, title).await
         }
         Some(Command::Respond { request_id }) => {
-            if request_id.len() != 8 || !request_id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-                return Err(eyre::eyre!(
-                    "invalid request ID (expected 8 hex chars)"
-                ));
-            }
+            validate_request_id(&request_id)?;
             let content = read_stdin()?;
             // Write the response file directly — no RPC needed
             std::fs::create_dir_all(response_dir())?;
@@ -233,6 +253,70 @@ async fn assign_once(
         .map_err(|e| eyre::eyre!("{e:?}"))?;
 
     Ok(request_id)
+}
+
+fn validate_request_id(request_id: &str) -> Result<()> {
+    if request_id.len() != 8
+        || !request_id
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(eyre::eyre!(
+            "invalid request ID (expected 8 hex chars)"
+        ));
+    }
+    Ok(())
+}
+
+fn cancel_request(request_id: &str) -> Result<()> {
+    validate_request_id(request_id)?;
+    let path = request_dir().join(request_id);
+    if !path.exists() {
+        eprintln!("No task with ID {request_id} found.");
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&path)?;
+    eprintln!("Task {request_id} cancelled.");
+    Ok(())
+}
+
+fn nudge_request(request_id: &str) -> Result<()> {
+    validate_request_id(request_id)?;
+    let path = request_dir().join(request_id);
+    let meta = util::read_request_meta(&path).ok_or_else(|| {
+        eyre::eyre!("No task with ID {request_id} found.")
+    })?;
+    let message = format!(
+        "Hey buddy — task {request_id} is still waiting for your response. Need a hand?"
+    );
+    tmux::send_to_pane(&meta.target_pane, &message)?;
+    eprintln!("Nudged buddy for task {request_id} on pane {}.", meta.target_pane);
+    Ok(())
+}
+
+async fn retry_request(request_id: &str) -> Result<()> {
+    validate_request_id(request_id)?;
+    let path = request_dir().join(request_id);
+    let meta = util::read_request_meta(&path).ok_or_else(|| {
+        eyre::eyre!("No task with ID {request_id} found.")
+    })?;
+    let content = util::read_request_content(&path).ok_or_else(|| {
+        eyre::eyre!("Task {request_id} is missing request content.")
+    })?;
+    std::fs::remove_dir_all(&path)?;
+
+    ensure_server_running().await?;
+    let binary_hash = hash::binary_hash();
+    let new_request_id = assign_once(
+        &meta.source_pane,
+        &content,
+        true,
+        meta.title,
+        &binary_hash,
+    )
+    .await?;
+    eprintln!("Retried task {request_id} as {new_request_id}.");
+    Ok(())
 }
 
 fn list_requests() -> Result<()> {
