@@ -445,6 +445,10 @@ async fn maybe_notify_idle(
             message.push_str(&format!("\nLast completed: **{last_title}**"));
         }
         let lines: Vec<&str> = pending.pane_capture.lines().collect();
+        let lines = crate::util::trim_agent_footer(&lines);
+        if lines.is_empty() {
+            continue;
+        }
         let half = lines.len() / 2;
         let bottom: String = lines[half..].join("\n");
         message.push_str(&format!("\n```\n{bottom}\n```"));

@@ -21,6 +21,59 @@ pub fn format_age(age: Duration) -> String {
     }
 }
 
+pub fn trim_agent_footer<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    let mut end = lines.len();
+    while end > 0 {
+        let line = lines[end - 1];
+        if is_agent_footer_line(line) {
+            end -= 1;
+            continue;
+        }
+        break;
+    }
+    &lines[..end]
+}
+
+fn is_agent_footer_line(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return true;
+    }
+
+    if line.starts_with("✻ Worked for") {
+        return true;
+    }
+
+    if line.starts_with("▸▸ bypass permissions") {
+        return true;
+    }
+
+    if line.contains("tokens") && line.chars().any(|ch| ch.is_ascii_digit()) {
+        return true;
+    }
+
+    if line.contains("current:") && line.contains("latest:") {
+        return true;
+    }
+
+    if line.contains("gpt-") || line.contains("claude-") {
+        return true;
+    }
+
+    if line.starts_with("› Run /") {
+        return true;
+    }
+
+    if line.contains("· left ·") || line.contains("% left") {
+        return true;
+    }
+
+    if line.contains("esc to interrupt") {
+        return true;
+    }
+
+    false
+}
+
 pub fn write_request(
     dir: &Path,
     source_pane: &str,
