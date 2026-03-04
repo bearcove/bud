@@ -42,6 +42,12 @@ enum Command {
         #[facet(args::positional)]
         request_id: String,
     },
+    /// Show full task details for a request
+    Show {
+        /// The request ID to show
+        #[facet(args::positional)]
+        request_id: String,
+    },
     /// Steer a buddy on an in-flight request (reads from stdin)
     Steer {
         /// The request ID to steer
@@ -74,6 +80,7 @@ USAGE:
     bud cancel <id>                  Cancel a pending request
     bud nudge <id>                   Remind buddy about a pending request
     bud retry <id>                   Reassign a request with a new ID
+    bud show <id>                    Show full task content for a request
     cat <<'EOF' | bud steer <id>     Steer buddy on a pending request
     cat <<'EOF' | bud assign                 Assign a task (clears worker context)
     cat <<'EOF' | bud assign --keep          Assign, keeping worker's context
@@ -150,6 +157,7 @@ async fn main() -> Result<()> {
         Some(Command::Cancel { request_id }) => cancel_request(&request_id),
         Some(Command::Nudge { request_id }) => nudge_request(&request_id),
         Some(Command::Retry { request_id }) => retry_request(&request_id).await,
+        Some(Command::Show { request_id }) => show_request(&request_id),
         Some(Command::Steer { request_id }) => steer_request(&request_id),
         Some(Command::Assign { keep, title }) => {
             let pane = std::env::var("TMUX_PANE")
@@ -324,6 +332,24 @@ fn steer_request(request_id: &str) -> Result<()> {
         "Sent steer update for task {request_id} to pane {}.",
         meta.target_pane
     );
+    Ok(())
+}
+
+fn show_request(request_id: &str) -> Result<()> {
+    validate_request_id(request_id)?;
+    let path = request_dir().join(request_id);
+    let meta = util::read_request_meta(&path)
+        .ok_or_else(|| eyre::eyre!("No task with ID {request_id} found."))?;
+    let content = util::read_request_content(&path)
+        .ok_or_else(|| eyre::eyre!("Task {request_id} is missing request content."))?;
+    eprintln!("Task {request_id}");
+    eprintln!(
+        "Source: {}  Target: {}",
+        meta.source_pane, meta.target_pane
+    );
+    eprintln!("Title: {}", meta.title.as_deref().unwrap_or("(none)"));
+    eprintln!();
+    eprintln!("{content}");
     Ok(())
 }
 
