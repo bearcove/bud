@@ -34,6 +34,8 @@ struct IdleState {
     notified: bool,
     last_title: Option<String>,
     source_pane: Option<String>,
+    last_pane_content: Option<String>,
+    pane_unchanged_since: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -100,11 +102,15 @@ impl crate::protocol::Coop for CoopServer {
                 notified: false,
                 last_title: None,
                 source_pane: None,
+                last_pane_content: None,
+                pane_unchanged_since: None,
             });
             state.empty_since = None;
             state.notified = false;
             state.last_title = None;
             state.source_pane = None;
+            state.last_pane_content = None;
+            state.pane_unchanged_since = None;
         }
 
         let request_path = self.request_root_dir.join(&session_name).join(&request_id);
@@ -352,30 +358,83 @@ async fn maybe_notify_idle(
         session_name: String,
         empty_since: Instant,
         last_title: Option<String>,
-        source_pane: Option<String>,
+        source_pane: String,
+        pane_capture: String,
     }
 
-    let sessions_to_notify: Vec<PendingNotify> = {
-        let mut states = idle_states.lock().await;
-        let mut pending = Vec::new();
-        for (session_name, state) in states.iter_mut() {
-            let Some(empty_since) = state.empty_since else {
-                continue;
-            };
-            if state.notified || empty_since.elapsed() < IDLE_NOTIFY_DELAY {
+    struct Candidate {
+        session_name: String,
+        source_pane: String,
+    }
+
+    let candidates: Vec<Candidate> = {
+        let states = idle_states.lock().await;
+        states
+            .iter()
+            .filter_map(|(session_name, state)| {
+                let source_pane = state.source_pane.as_deref()?;
+                let empty_since = state.empty_since?;
+                if state.notified || empty_since.elapsed() < IDLE_NOTIFY_DELAY {
+                    return None;
+                }
+                Some(Candidate {
+                    session_name: session_name.clone(),
+                    source_pane: source_pane.to_string(),
+                })
+            })
+            .collect()
+    };
+
+    let mut sessions_to_notify: Vec<PendingNotify> = Vec::new();
+    for candidate in candidates {
+        let pane_capture = match tmux::capture_pane(&candidate.source_pane) {
+            Ok(content) => content,
+            Err(e) => {
+                warn!(
+                    "failed to capture source pane {} for idle tracking in session {}: {e}",
+                    candidate.source_pane, candidate.session_name
+                );
                 continue;
             }
-            // Mark before releasing lock so we can't double-fire on the next tick.
-            state.notified = true;
-            pending.push(PendingNotify {
-                session_name: session_name.clone(),
-                empty_since,
-                last_title: state.last_title.clone(),
-                source_pane: state.source_pane.clone(),
-            });
+        };
+
+        let now = Instant::now();
+        let mut states = idle_states.lock().await;
+        let Some(state) = states.get_mut(&candidate.session_name) else {
+            continue;
+        };
+        let Some(empty_since) = state.empty_since else {
+            continue;
+        };
+        if state.notified || empty_since.elapsed() < IDLE_NOTIFY_DELAY {
+            continue;
         }
-        pending
-    };
+        if state.source_pane.as_deref() != Some(candidate.source_pane.as_str()) {
+            continue;
+        }
+
+        match state.last_pane_content.as_deref() {
+            Some(previous) if previous == pane_capture => {
+                let unchanged_since = state.pane_unchanged_since.get_or_insert(now);
+                if unchanged_since.elapsed() < IDLE_NOTIFY_DELAY {
+                    continue;
+                }
+                // Mark before releasing lock so we can't double-fire on the next tick.
+                state.notified = true;
+                sessions_to_notify.push(PendingNotify {
+                    session_name: candidate.session_name,
+                    empty_since,
+                    last_title: state.last_title.clone(),
+                    source_pane: candidate.source_pane,
+                    pane_capture,
+                });
+            }
+            _ => {
+                state.last_pane_content = Some(pane_capture);
+                state.pane_unchanged_since = Some(now);
+            }
+        }
+    }
 
     for pending in sessions_to_notify {
         let mut message = format!(
@@ -385,22 +444,10 @@ async fn maybe_notify_idle(
         if let Some(last_title) = pending.last_title.as_deref() {
             message.push_str(&format!("\nLast completed: **{last_title}**"));
         }
-        if let Some(source_pane) = pending.source_pane.as_deref() {
-            match tmux::capture_pane(source_pane) {
-                Ok(capture) => {
-                    let lines: Vec<&str> = capture.lines().collect();
-                    let half = lines.len() / 2;
-                    let bottom: String = lines[half..].join("\n");
-                    message.push_str(&format!("\n```\n{bottom}\n```"));
-                }
-                Err(e) => {
-                    warn!(
-                        "failed to capture source pane {} for idle notification in session {}: {e}",
-                        source_pane, pending.session_name
-                    );
-                }
-            }
-        }
+        let lines: Vec<&str> = pending.pane_capture.lines().collect();
+        let half = lines.len() / 2;
+        let bottom: String = lines[half..].join("\n");
+        message.push_str(&format!("\n```\n{bottom}\n```"));
         if let Err(e) = crate::discord::notify(webhook_url, &message).await {
             error!(
                 "failed to send Discord idle notification for session {}: {e}",
@@ -409,6 +456,7 @@ async fn maybe_notify_idle(
             let mut states = idle_states.lock().await;
             if let Some(state) = states.get_mut(&pending.session_name)
                 && state.empty_since == Some(pending.empty_since)
+                && state.source_pane.as_deref() == Some(pending.source_pane.as_str())
             {
                 state.notified = false;
             }
@@ -624,8 +672,20 @@ async fn process_response_files(
             } else {
                 crate::warmth::delivered().to_string()
             };
+            let git_status = std::process::Command::new("git")
+                .args(["status", "--short"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            let git_section = if git_status.is_empty() {
+                String::new()
+            } else {
+                format!("\n\ngit status:\n```\n{git_status}\n```")
+            };
             let message = format!(
-                "{intro}\n{body}\n\nRemember: you're the captain. If there's follow-up work, assign it to your buddy — don't do it yourself. Stay focused on the big picture!"
+                "{intro}\n{body}\n\nRemember: you're the captain. If there's follow-up work, assign it to your buddy — don't do it yourself. Stay focused on the big picture!\n\nThis is also a good time to commit and push your buddy's work so far.{git_section}"
             );
             if let Err(e) = tmux::send_to_pane(&source_pane, &message) {
                 error!("failed to deliver response to pane {}: {e}", source_pane);
@@ -662,11 +722,15 @@ async fn process_response_files(
                     notified: false,
                     last_title: None,
                     source_pane: None,
+                    last_pane_content: None,
+                    pane_unchanged_since: None,
                 });
                 state.empty_since = Some(Instant::now());
                 state.notified = false;
                 state.last_title = title.clone();
                 state.source_pane = Some(source_pane.clone());
+                state.last_pane_content = None;
+                state.pane_unchanged_since = None;
             }
         }
     }
