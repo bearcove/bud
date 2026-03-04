@@ -185,7 +185,7 @@ pub async fn run_server(
                 .await;
             match result {
                 Ok((_caller, sh)) => {
-                    std::future::pending::<()>().await;
+                    tokio::time::sleep(Duration::from_secs(300)).await;
                     drop(_caller);
                     drop(sh);
                 }

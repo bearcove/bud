@@ -295,9 +295,7 @@ fn validate_request_id(request_id: &str) -> Result<()> {
 }
 
 fn print_steer_hint(request_id: &str) {
-    eprintln!(
-        "If you need to give additional direction, use: cat <<'EOF' | bud steer {request_id}\n"
-    );
+    eprintln!("Request ID: {request_id}");
 }
 
 fn cancel_request(request_id: &str) -> Result<()> {
@@ -387,7 +385,7 @@ async fn retry_request(request_id: &str) -> Result<()> {
     let new_request_id = assign_once(
         &meta.source_pane,
         &content,
-        true,
+        false,
         meta.title,
         &binary_hash,
     )
