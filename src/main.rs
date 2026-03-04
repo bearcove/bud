@@ -679,6 +679,10 @@ fn wait_for_response(request_id: &str, timeout_secs: u64) -> Result<()> {
         eprintln!("{response}");
         return Ok(());
     }
+    if !request_path.exists() {
+        eprintln!("Response for {request_id} has been delivered to your pane.");
+        return Ok(());
+    }
 
     eprintln!("Waiting for response on {request_id} for up to {timeout_secs}s...");
 
@@ -689,6 +693,10 @@ fn wait_for_response(request_id: &str, timeout_secs: u64) -> Result<()> {
         if response_path.exists() {
             let response = std::fs::read_to_string(&response_path)?;
             eprintln!("{response}");
+            return Ok(());
+        }
+        if !request_path.exists() {
+            eprintln!("Response for {request_id} has been delivered to your pane.");
             return Ok(());
         }
 
