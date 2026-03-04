@@ -403,8 +403,20 @@ fn update_request(request_id: &str) -> Result<()> {
         .as_deref()
         .map(|title| format!(" ({title})"))
         .unwrap_or_default();
+    let git_status = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let git_section = if git_status.is_empty() {
+        String::new()
+    } else {
+        format!("\n\ngit status:\n```\n{git_status}\n```")
+    };
     let update = format!(
-        "📋 Progress update from your buddy on task {request_id}{title_suffix}:\n\n{message}\n\nWhether you're happy or unhappy with this update, reply to your buddy (not the user!) with:\n\ncat <<'BUDEOF' | bud steer {request_id}\n<your reply here>\nBUDEOF\n\nThis is also a good time to commit and push your buddy's work so far."
+        "📋 Progress update from your buddy on task {request_id}{title_suffix}:\n\n{message}\n\nWhether you're happy or unhappy with this update, reply to your buddy (not the user!) with:\n\ncat <<'BUDEOF' | bud steer {request_id}\n<your reply here>\nBUDEOF\n\nThis is also a good time to commit and push your buddy's work so far.{git_section}"
     );
     tmux::send_to_pane(&meta.source_pane, &update)?;
     eprintln!(
