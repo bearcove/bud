@@ -48,6 +48,12 @@ enum Command {
         #[facet(args::positional)]
         request_id: String,
     },
+    /// Capture and show the buddy pane for a request
+    Spy {
+        /// The request ID to spy on
+        #[facet(args::positional)]
+        request_id: String,
+    },
     /// Steer a buddy on an in-flight request (reads from stdin)
     Steer {
         /// The request ID to steer
@@ -81,6 +87,7 @@ USAGE:
     bud nudge <id>                   Remind buddy about a pending request
     bud retry <id>                   Reassign a request with a new ID
     bud show <id>                    Show full task content for a request
+    bud spy <id>                     Peek at buddy's pane
     cat <<'EOF' | bud steer <id>     Steer buddy on a pending request
     cat <<'EOF' | bud assign                 Assign a task (clears worker context)
     cat <<'EOF' | bud assign --keep          Assign, keeping worker's context
@@ -158,6 +165,7 @@ async fn main() -> Result<()> {
         Some(Command::Nudge { request_id }) => nudge_request(&request_id),
         Some(Command::Retry { request_id }) => retry_request(&request_id).await,
         Some(Command::Show { request_id }) => show_request(&request_id),
+        Some(Command::Spy { request_id }) => spy_request(&request_id),
         Some(Command::Steer { request_id }) => steer_request(&request_id),
         Some(Command::Assign { keep, title }) => {
             let pane = std::env::var("TMUX_PANE")
@@ -350,6 +358,16 @@ fn show_request(request_id: &str) -> Result<()> {
     eprintln!("Title: {}", meta.title.as_deref().unwrap_or("(none)"));
     eprintln!();
     eprintln!("{content}");
+    Ok(())
+}
+
+fn spy_request(request_id: &str) -> Result<()> {
+    validate_request_id(request_id)?;
+    let path = request_dir().join(request_id);
+    let meta = util::read_request_meta(&path)
+        .ok_or_else(|| eyre::eyre!("No task with ID {request_id} found."))?;
+    let pane_content = tmux::capture_pane(&meta.target_pane)?;
+    eprintln!("Pane {}:\n{}", meta.target_pane, pane_content);
     Ok(())
 }
 
