@@ -250,18 +250,27 @@ fn list_requests() -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    let mut rows: Vec<(String, String, Option<String>, String, &'static str)> = Vec::new();
+    struct Row {
+        id: String,
+        source: String,
+        target: String,
+        title: Option<String>,
+        age: String,
+        response: &'static str,
+    }
+    let mut rows: Vec<Row> = Vec::new();
     let now = SystemTime::now();
 
     for entry in entries {
         let entry = entry?;
-        if !entry.file_type()?.is_file() {
+        if !entry.file_type()?.is_dir() {
             continue;
         }
 
         let id = entry.file_name().to_string_lossy().to_string();
-        let (source_pane, title) = util::parse_request_file(&entry.path())
-            .unwrap_or_else(|| ("(unreadable)".to_string(), None));
+        let (source_pane, target_pane, title) = util::read_request_meta(&entry.path())
+            .map(|meta| (meta.source_pane, meta.target_pane, meta.title))
+            .unwrap_or_else(|| ("(unreadable)".to_string(), "(unknown)".to_string(), None));
 
         let age = entry
             .metadata()
@@ -277,7 +286,7 @@ fn list_requests() -> Result<()> {
             "no"
         };
 
-        rows.push((id, source_pane, title, age, response_exists));
+        rows.push(Row { id, source: source_pane, target: target_pane, title, age, response: response_exists });
     }
 
     if rows.is_empty() {
@@ -285,27 +294,31 @@ fn list_requests() -> Result<()> {
         return Ok(());
     }
 
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    let show_title = rows.iter().any(|(_, _, title, _, _)| title.is_some());
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    let show_title = rows.iter().any(|r| r.title.is_some());
 
     if show_title {
-        eprintln!("REQUEST     SOURCE        TITLE                      AGE         RESPONSE");
-        eprintln!("----------  ------------  -------------------------  ----------  --------");
-        for (id, source, title, age, response) in rows {
+        eprintln!("REQUEST     SOURCE        TARGET       TITLE                      AGE         RESPONSE");
+        eprintln!("----------  ------------  -----------  -------------------------  ----------  --------");
+        for r in &rows {
             eprintln!(
-                "{:<10}  {:<12}  {:<25}  {:<10}  {}",
-                id,
-                source,
-                title.unwrap_or_else(|| "-".to_string()),
-                age,
-                response
+                "{:<10}  {:<12}  {:<11}  {:<25}  {:<10}  {}",
+                r.id,
+                r.source,
+                r.target,
+                r.title.as_deref().unwrap_or("-"),
+                r.age,
+                r.response
             );
         }
     } else {
-        eprintln!("REQUEST     SOURCE        AGE         RESPONSE");
-        eprintln!("----------  ------------  ----------  --------");
-        for (id, source, _title, age, response) in rows {
-            eprintln!("{:<10}  {:<12}  {:<10}  {}", id, source, age, response);
+        eprintln!("REQUEST     SOURCE        TARGET       AGE         RESPONSE");
+        eprintln!("----------  ------------  -----------  ----------  --------");
+        for r in &rows {
+            eprintln!(
+                "{:<10}  {:<12}  {:<11}  {:<10}  {}",
+                r.id, r.source, r.target, r.age, r.response
+            );
         }
     }
 

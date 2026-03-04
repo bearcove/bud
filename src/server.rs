@@ -15,6 +15,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 struct Request {
     source_pane: String,
+    target_pane: String,
     title: Option<String>,
 }
 
@@ -50,16 +51,34 @@ impl crate::protocol::Coop for CoopServer {
             }
         };
 
+        let task_content = if let Some(title) = title_for_file.as_deref() {
+            format!("## {title}\n\n{content}")
+        } else {
+            content
+        };
+
         // Store the request
         self.requests
             .lock()
             .await
-            .insert(request_id.clone(), Request { source_pane: source_pane.clone(), title });
+            .insert(
+                request_id.clone(),
+                Request {
+                    source_pane: source_pane.clone(),
+                    target_pane: target.id.clone(),
+                    title,
+                },
+            );
         let request_path = self.request_dir.join(&request_id);
-        let request_file_contents =
-            crate::util::serialize_request_file(&source_pane, title_for_file.as_deref());
-        if let Err(e) = std::fs::write(&request_path, request_file_contents) {
+        if let Err(e) = crate::util::write_request(
+            &request_path,
+            &source_pane,
+            &target.id,
+            title_for_file.as_deref(),
+            &task_content,
+        ) {
             self.requests.lock().await.remove(&request_id);
+            let _ = std::fs::remove_dir_all(&request_path);
             return Err(format!(
                 "failed to persist request {} to {}: {e}",
                 request_id,
@@ -75,11 +94,6 @@ impl crate::protocol::Coop for CoopServer {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
 
-        let task_content = if let Some(title) = title_for_file {
-            format!("## {title}\n\n{content}")
-        } else {
-            content
-        };
         let message = format!(
             "{}\n\n\
              {task_content}\n\n\
@@ -94,11 +108,11 @@ impl crate::protocol::Coop for CoopServer {
         if let Err(e) = tmux::send_to_pane(&target.id, &message) {
             error!("failed to send to pane {}: {e}", target.id);
             self.requests.lock().await.remove(&request_id);
-            if let Err(remove_err) = std::fs::remove_file(&request_path)
+            if let Err(remove_err) = std::fs::remove_dir_all(&request_path)
                 && remove_err.kind() != std::io::ErrorKind::NotFound
             {
                 error!(
-                    "failed to remove request file {}: {remove_err}",
+                    "failed to remove request directory {}: {remove_err}",
                     request_path.display()
                 );
             }
@@ -259,7 +273,7 @@ fn run_timeout_checks(
         for entry in request_entries.flatten() {
             let path = entry.path();
             match entry.file_type() {
-                Ok(file_type) if file_type.is_file() => {}
+                Ok(file_type) if file_type.is_dir() => {}
                 _ => continue,
             }
 
@@ -293,22 +307,22 @@ fn run_timeout_checks(
                 continue;
             }
 
-            let (source_pane, title) = match crate::util::parse_request_file(&path) {
-                Some(request) => request,
+            let meta = match crate::util::read_request_meta(&path) {
+                Some(meta) => meta,
                 None => continue,
             };
             let message = format!(
                 "⏰ Hey captain — your task {request_id}{} has been pending for {}. Your buddy might be stuck!",
-                title
+                meta.title
                     .as_deref()
                     .map(|title| format!(" ({title})"))
                     .unwrap_or_default(),
                 crate::util::format_age(age),
             );
-            if let Err(e) = tmux::send_to_pane(&source_pane, &message) {
+            if let Err(e) = tmux::send_to_pane(&meta.source_pane, &message) {
                 error!(
                     "failed to deliver timeout notification for request {} to pane {}: {e}",
-                    request_id, source_pane
+                    request_id, meta.source_pane
                 );
                 continue;
             }
@@ -342,11 +356,11 @@ async fn process_response_files(
             reqs.remove(&request_id)
         };
         let request_path = request_dir.join(&request_id);
-        let (source_pane, title) = if let Some(request) = in_memory_request {
-            (request.source_pane, request.title)
+        let (source_pane, target_pane, title) = if let Some(request) = in_memory_request {
+            (request.source_pane, request.target_pane, request.title)
         } else {
-            match crate::util::parse_request_file(&request_path) {
-                Some(request) => request,
+            match crate::util::read_request_meta(&request_path) {
+                Some(meta) => (meta.source_pane, meta.target_pane, meta.title),
                 None => continue,
             }
         };
@@ -368,10 +382,10 @@ async fn process_response_files(
             continue;
         }
 
-        if let Err(e) = std::fs::remove_file(&request_path)
+        if let Err(e) = std::fs::remove_dir_all(&request_path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
-            error!("failed to remove request file {}: {e}", request_path.display());
+            error!("failed to remove request directory {}: {e}", request_path.display());
         }
         timeout_notified.remove(&request_id);
         if let Err(e) = std::fs::remove_file(&path)
@@ -380,6 +394,6 @@ async fn process_response_files(
             error!("failed to remove response file {}: {e}", path.display());
         }
 
-        info!("delivered response for request {request_id}");
+        info!("delivered response for request {request_id} (target pane {target_pane})");
     }
 }
