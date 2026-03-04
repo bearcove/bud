@@ -4,8 +4,8 @@ use facet::Facet;
 pub struct AssignRequest {
     /// The $TMUX_PANE of the requesting agent
     pub source_pane: String,
-    /// Path to the file containing the task description
-    pub task_file: String,
+    /// The task content (read from stdin by the CLI)
+    pub content: String,
     /// Whether to send /clear to the worker before the task
     pub clear: bool,
 }

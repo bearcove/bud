@@ -42,7 +42,6 @@ pub fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
         return Err(eyre::eyre!("tmux send-keys (text) failed for pane {pane_id}"));
     }
 
-    // Small delay to let the text arrive before submitting
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Submit with C-m (carriage return) — "Enter" alone doesn't work in some apps
