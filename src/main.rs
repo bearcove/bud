@@ -21,6 +21,8 @@ struct Args {
 enum Command {
     /// Start the bud server in the foreground
     Server,
+    /// List pending/in-flight requests
+    List,
     /// Assign a task to another agent (reads from stdin)
     Assign {
         /// Keep the worker's existing context (default: clear it)
@@ -40,6 +42,7 @@ const MANUAL: &str = r#"bud - cooperative agents over tmux
 USAGE:
     bud                              Show this manual
     bud server                       Start the server (usually auto-started)
+    bud list                         List pending/in-flight requests
     cat <<'EOF' | bud assign         Assign a task (clears worker context)
     cat <<'EOF' | bud assign --keep  Assign, keeping worker's context
     cat <<'EOF' | bud respond <id>   Respond to a task (reads stdin)
@@ -110,6 +113,7 @@ async fn main() -> Result<()> {
             )
                 .await
         }
+        Some(Command::List) => list_requests(),
         Some(Command::Assign { keep }) => {
             let pane = std::env::var("TMUX_PANE")
                 .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
@@ -217,4 +221,79 @@ async fn assign_once(source_pane: &str, content: &str, clear: bool, binary_hash:
         .map_err(|e| eyre::eyre!("{e:?}"))?;
 
     Ok(request_id)
+}
+
+fn list_requests() -> Result<()> {
+    use std::time::SystemTime;
+
+    let request_dir = request_dir();
+    let response_dir = response_dir();
+
+    let entries = match std::fs::read_dir(&request_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("No tasks in flight — all clear!");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut rows: Vec<(String, String, String, &'static str)> = Vec::new();
+    let now = SystemTime::now();
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let id = entry.file_name().to_string_lossy().to_string();
+        let source_pane = std::fs::read_to_string(entry.path())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "(unreadable)".to_string());
+
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.created().ok().or_else(|| meta.modified().ok()))
+            .and_then(|timestamp| now.duration_since(timestamp).ok())
+            .map(format_age)
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let response_exists = if response_dir.join(format!("{id}.md")).exists() {
+            "yes"
+        } else {
+            "no"
+        };
+
+        rows.push((id, source_pane, age, response_exists));
+    }
+
+    if rows.is_empty() {
+        eprintln!("No tasks in flight — all clear!");
+        return Ok(());
+    }
+
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    eprintln!("REQUEST     SOURCE        AGE         RESPONSE");
+    eprintln!("----------  ------------  ----------  --------");
+    for (id, source, age, response) in rows {
+        eprintln!("{:<10}  {:<12}  {:<10}  {}", id, source, age, response);
+    }
+
+    Ok(())
+}
+
+fn format_age(age: std::time::Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
 }
