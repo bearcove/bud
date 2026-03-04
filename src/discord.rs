@@ -1,18 +1,12 @@
 use eyre::Result;
 
-pub async fn notify(webhook_url: &str, message: &str, attachment: Option<&str>) -> Result<()> {
+pub async fn notify(webhook_url: &str, message: &str) -> Result<()> {
     let client = reqwest::Client::new();
-    let mut form = reqwest::multipart::Form::new()
-        .text("payload_json", format!("{{\"content\":\"{}\"}}", escape_json(message)));
-    if let Some(content) = attachment {
-        let part = reqwest::multipart::Part::bytes(content.as_bytes().to_vec())
-            .file_name("pane.txt")
-            .mime_str("text/plain")?;
-        form = form.part("files[0]", part);
-    }
+    let payload = format!("{{\"content\":\"{}\"}}", escape_json(message));
     client
         .post(webhook_url)
-        .multipart(form)
+        .header("content-type", "application/json")
+        .body(payload)
         .send()
         .await?
         .error_for_status()?;
