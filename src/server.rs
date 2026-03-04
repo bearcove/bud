@@ -1,8 +1,10 @@
 use crate::protocol::{CoopClient, CoopDispatcher};
 use crate::tmux;
 use eyre::Result;
+use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use roam_stream::StreamLink;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -178,134 +180,207 @@ async fn watch_responses(
     requests: Arc<Mutex<HashMap<String, Request>>>,
 ) {
     let mut timeout_notified: HashSet<String> = HashSet::new();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<notify::Result<notify::Event>>();
 
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        let mut active_request_ids: HashSet<String> = HashSet::new();
-        if let Ok(request_entries) = std::fs::read_dir(&request_dir) {
-            for entry in request_entries.flatten() {
-                let path = entry.path();
-                match entry.file_type() {
-                    Ok(file_type) if file_type.is_file() => {}
-                    _ => continue,
-                }
-
-                let request_id = match path.file_name().and_then(|s| s.to_str()) {
-                    Some(id) => id.to_string(),
-                    None => continue,
-                };
-                active_request_ids.insert(request_id.clone());
-
-                let response_path = response_dir.join(format!("{request_id}.md"));
-                if response_path.exists() || timeout_notified.contains(&request_id) {
-                    continue;
-                }
-
-                let metadata = match std::fs::metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(_) => continue,
-                };
-                let created_or_modified = metadata
-                    .created()
-                    .ok()
-                    .or_else(|| metadata.modified().ok());
-                let age = match created_or_modified
-                    .and_then(|timestamp| SystemTime::now().duration_since(timestamp).ok())
-                {
-                    Some(age) => age,
-                    None => continue,
-                };
-
-                if age <= REQUEST_TIMEOUT {
-                    continue;
-                }
-
-                let (source_pane, title) = match parse_request_file(&path) {
-                    Some(request) => request,
-                    None => continue,
-                };
-                let message = format!(
-                    "⏰ Hey captain — your task {request_id}{} has been pending for {}. Your buddy might be stuck!",
-                    title
-                        .as_deref()
-                        .map(|title| format!(" ({title})"))
-                        .unwrap_or_default(),
-                    format_age(age),
-                );
-                if let Err(e) = tmux::send_to_pane(&source_pane, &message) {
+    let mut watcher: Option<RecommendedWatcher> =
+        match RecommendedWatcher::new(
+            move |result| {
+                let _ = event_tx.send(result);
+            },
+            Config::default(),
+        ) {
+            Ok(mut watcher) => {
+                if let Err(e) = watcher.watch(&response_dir, RecursiveMode::NonRecursive) {
                     error!(
-                        "failed to deliver timeout notification for request {} to pane {}: {e}",
-                        request_id, source_pane
+                        "failed to start response watcher on {}: {e}; falling back to polling",
+                        response_dir.display()
                     );
-                    continue;
+                    None
+                } else {
+                    Some(watcher)
                 }
-
-                timeout_notified.insert(request_id);
             }
-        }
-        timeout_notified.retain(|id| active_request_ids.contains(id));
-
-        let entries = match std::fs::read_dir(&response_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                error!(
+                    "failed to initialize response watcher for {}: {e}; falling back to polling",
+                    response_dir.display()
+                );
+                None
+            }
         };
 
-        for entry in entries.flatten() {
+    process_response_files(&response_dir, &request_dir, &requests, &mut timeout_notified).await;
+
+    let mut timeout_tick = tokio::time::interval(Duration::from_secs(2));
+    let mut poll_tick = tokio::time::interval(Duration::from_secs(2));
+
+    loop {
+        if watcher.is_some() {
+            tokio::select! {
+                _ = timeout_tick.tick() => {
+                    run_timeout_checks(&request_dir, &response_dir, &mut timeout_notified);
+                }
+                maybe_event = event_rx.recv() => {
+                    match maybe_event {
+                        Some(Ok(event)) if matches!(event.kind, EventKind::Create(_)) => {
+                            process_response_files(&response_dir, &request_dir, &requests, &mut timeout_notified).await;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            error!("response watcher event error: {e}");
+                        }
+                        None => {
+                            error!("response watcher channel closed; falling back to polling");
+                            watcher = None;
+                        }
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                _ = timeout_tick.tick() => {
+                    run_timeout_checks(&request_dir, &response_dir, &mut timeout_notified);
+                }
+                _ = poll_tick.tick() => {
+                    process_response_files(&response_dir, &request_dir, &requests, &mut timeout_notified).await;
+                }
+            }
+        }
+    }
+}
+
+fn run_timeout_checks(
+    request_dir: &Path,
+    response_dir: &Path,
+    timeout_notified: &mut HashSet<String>,
+) {
+    let mut active_request_ids: HashSet<String> = HashSet::new();
+    if let Ok(request_entries) = std::fs::read_dir(request_dir) {
+        for entry in request_entries.flatten() {
             let path = entry.path();
-            let request_id = match path.file_stem().and_then(|s| s.to_str()) {
+            match entry.file_type() {
+                Ok(file_type) if file_type.is_file() => {}
+                _ => continue,
+            }
+
+            let request_id = match path.file_name().and_then(|s| s.to_str()) {
                 Some(id) => id.to_string(),
                 None => continue,
             };
+            active_request_ids.insert(request_id.clone());
 
-            let in_memory_request = {
-                let mut reqs = requests.lock().await;
-                reqs.remove(&request_id)
+            let response_path = response_dir.join(format!("{request_id}.md"));
+            if response_path.exists() || timeout_notified.contains(&request_id) {
+                continue;
+            }
+
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
             };
-            let request_path = request_dir.join(&request_id);
-            let (source_pane, title) = if let Some(request) = in_memory_request {
-                (request.source_pane, request.title)
-            } else {
-                match parse_request_file(&request_path) {
-                    Some(request) => request,
-                    None => continue,
-                }
+            let created_or_modified = metadata
+                .created()
+                .ok()
+                .or_else(|| metadata.modified().ok());
+            let age = match created_or_modified
+                .and_then(|timestamp| SystemTime::now().duration_since(timestamp).ok())
+            {
+                Some(age) => age,
+                None => continue,
             };
 
-            let body = match std::fs::read_to_string(&path) {
-                Ok(content) => content,
-                Err(_) => "(could not read response file)".to_string(),
-            };
-            let intro = if let Some(title) = title.as_deref() {
-                format!("Fresh from your buddy — re: {title}")
-            } else {
-                crate::warmth::delivered().to_string()
+            if age <= REQUEST_TIMEOUT {
+                continue;
+            }
+
+            let (source_pane, title) = match parse_request_file(&path) {
+                Some(request) => request,
+                None => continue,
             };
             let message = format!(
-                "{intro}\n{body}\n\nRemember: you're the captain. If there's follow-up work, assign it to your buddy — don't do it yourself. Stay focused on the big picture!"
+                "⏰ Hey captain — your task {request_id}{} has been pending for {}. Your buddy might be stuck!",
+                title
+                    .as_deref()
+                    .map(|title| format!(" ({title})"))
+                    .unwrap_or_default(),
+                format_age(age),
             );
             if let Err(e) = tmux::send_to_pane(&source_pane, &message) {
                 error!(
-                    "failed to deliver response to pane {}: {e}",
-                    source_pane
+                    "failed to deliver timeout notification for request {} to pane {}: {e}",
+                    request_id, source_pane
                 );
                 continue;
             }
 
-            if let Err(e) = std::fs::remove_file(&request_path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                error!("failed to remove request file {}: {e}", request_path.display());
-            }
-            timeout_notified.remove(&request_id);
-            if let Err(e) = std::fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                error!("failed to remove response file {}: {e}", path.display());
-            }
-
-            info!("delivered response for request {request_id}");
+            timeout_notified.insert(request_id);
         }
+    }
+    timeout_notified.retain(|id| active_request_ids.contains(id));
+}
+
+async fn process_response_files(
+    response_dir: &Path,
+    request_dir: &Path,
+    requests: &Arc<Mutex<HashMap<String, Request>>>,
+    timeout_notified: &mut HashSet<String>,
+) {
+    let entries = match std::fs::read_dir(response_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let request_id = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+
+        let in_memory_request = {
+            let mut reqs = requests.lock().await;
+            reqs.remove(&request_id)
+        };
+        let request_path = request_dir.join(&request_id);
+        let (source_pane, title) = if let Some(request) = in_memory_request {
+            (request.source_pane, request.title)
+        } else {
+            match parse_request_file(&request_path) {
+                Some(request) => request,
+                None => continue,
+            }
+        };
+
+        let body = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => "(could not read response file)".to_string(),
+        };
+        let intro = if let Some(title) = title.as_deref() {
+            format!("Fresh from your buddy — re: {title}")
+        } else {
+            crate::warmth::delivered().to_string()
+        };
+        let message = format!(
+            "{intro}\n{body}\n\nRemember: you're the captain. If there's follow-up work, assign it to your buddy — don't do it yourself. Stay focused on the big picture!"
+        );
+        if let Err(e) = tmux::send_to_pane(&source_pane, &message) {
+            error!("failed to deliver response to pane {}: {e}", source_pane);
+            continue;
+        }
+
+        if let Err(e) = std::fs::remove_file(&request_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            error!("failed to remove request file {}: {e}", request_path.display());
+        }
+        timeout_notified.remove(&request_id);
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            error!("failed to remove response file {}: {e}", path.display());
+        }
+
+        info!("delivered response for request {request_id}");
     }
 }
 
