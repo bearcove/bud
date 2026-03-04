@@ -9,27 +9,26 @@ to each other and receive results back — without either agent knowing about tm
 
 ```
 ┌─────────────┐         ┌─────────────┐
-│  Agent A    │         │  Agent B    │
-│  (lead)     │         │  (worker)   │
+│  Captain    │         │  Buddy      │
+│  (claude)   │         │  (codex)    │
 │             │         │             │
 │ bud assign  │────┐    │             │
-│  task.md    │    │    │             │
+│  (stdin)    │    │    │             │
 └─────────────┘    │    └─────────────┘
                    ▼
             ┌────────────┐
             │ bud server │
             │            │
-            │ • reads task file
-            │ • sends to worker pane
+            │ • pastes task to buddy pane
             │ • watches /tmp/bud-responses/
             │ • delivers response back
             └────────────┘
 ```
 
-1. Agent A writes a task to a file and runs `bud assign task.md`
-2. The server reads the file and sends the task to the worker's tmux pane
-3. The worker does the work and writes its response to the path it was given
-4. The server detects the response file and delivers it back to Agent A's pane
+1. Captain pipes a task to `bud assign` via stdin
+2. The server pastes the task directly into the buddy's tmux pane
+3. The buddy does the work, then pipes their response to `bud respond <id>`
+4. The server detects the response file and delivers it back to the captain's pane
 
 Agents never deal with tmux, pane IDs, or polling. They just assign tasks and
 receive results as regular chat messages.
@@ -37,21 +36,66 @@ receive results as regular chat messages.
 ## Usage
 
 ```
-bud                        Show the manual
-bud server                 Start the server (usually auto-started)
-bud assign <task-file>     Assign a task to another agent
-bud assign --clear <file>  Clear worker context first, then assign
+bud                              Show the manual
+bud server                       Start the server (usually auto-started)
+cat <<'EOF' | bud assign         Assign a task (clears buddy context)
+cat <<'EOF' | bud assign --keep  Assign, keeping buddy's context
+cat <<'EOF' | bud respond <id>   Respond to a task (buddies use this)
 ```
 
-The server auto-starts on first `bud assign` if it isn't already running.
+The server auto-starts on first `bud assign` and auto-restarts when the
+binary changes (no manual restart needed after `cargo install`).
+
+## Paste detection
+
+Each message is prepended with a random 3-emoji marker (e.g. `🦊🪐🧿`).
+After pasting, bud polls the pane for either the emoji marker (small pastes)
+or the `[Pasted text ` indicator (large pastes). This ensures the paste has
+landed before submitting with Enter.
+
+## Agent detection
+
+Bud finds buddy panes by inspecting child processes of each tmux pane shell
+using `sysinfo`. Only panes running a `claude` or `codex` binary are considered.
+Pane discovery is scoped to the caller's tmux session, so multiple captain/buddy
+pairs can run in separate sessions without interfering.
+
+## Design decisions
+
+These are intentional choices, not bugs:
+
+- **One connection per assign**: Each `bud assign` opens a new roam connection.
+  The server-side task parks with `pending().await` to keep the session alive.
+  This is fine for a local dev tool doing a few requests per session — connection
+  count stays bounded by usage, not by time.
+
+- **Response files in /tmp**: Responses are written to `/tmp/bud-responses/`.
+  On a shared machine this is spoofable. Bud is a local dev tool — if you're
+  running it on a shared server, move state to `$XDG_RUNTIME_DIR`.
+
+- **8-char request IDs**: First 8 hex chars of a UUID. 4 billion possibilities.
+  Collision risk is negligible for local interactive use.
+
+- **Blocking I/O in async context**: tmux commands and sleeps use std blocking
+  APIs inside tokio tasks. With one connection at a time this doesn't stall
+  anything. Worth fixing if bud ever handles concurrent requests.
+
+- **PID-based server liveness**: `ensure_server_running` checks the pid file
+  and `kill -0`. PID reuse could cause false positives, but the binary hash
+  auto-restart covers most staleness scenarios.
+
+- **C-u before paste**: `send_to_pane` sends C-u to clear the input line before
+  pasting. The buddy pane is dedicated to bud — there's no user-typed input to
+  preserve.
 
 ## Requirements
 
 - tmux
-- Agents running in separate tmux panes
+- Agents running in separate tmux panes (same session)
 
 ## Built with
 
 - [roam](https://github.com/bearcove/roam) — RPC over unix socket
 - [figue](https://github.com/bearcove/figue) — CLI argument parsing
 - [facet](https://github.com/facet-rs/facet) — reflection
+- [sysinfo](https://github.com/GuillaumeGomez/sysinfo) — process inspection

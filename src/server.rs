@@ -69,6 +69,8 @@ impl crate::protocol::Coop for CoopServer {
 
         if let Err(e) = tmux::send_to_pane(&target.id, &message) {
             error!("failed to send to pane {}: {e}", target.id);
+            self.requests.lock().await.remove(&request_id);
+            return Err(format!("failed to send to pane {}: {e}", target.id));
         }
 
         info!("assigned request {request_id} -> pane {}", target.id);
@@ -184,4 +186,3 @@ async fn watch_responses(dir: PathBuf, requests: Arc<Mutex<HashMap<String, Reque
         }
     }
 }
-
