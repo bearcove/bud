@@ -107,11 +107,19 @@ pub fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Find a pane that is NOT the given pane_id (i.e., find the "other" agent).
+fn is_agent_pane(p: &Pane) -> bool {
+    // Claude Code: pane_title contains "Claude Code" exactly
+    // Codex: pane_current_command starts with "codex-"
+    p.title.contains("Claude Code") || p.command.starts_with("codex-")
+}
+
+/// Find a pane that is NOT the given pane_id and is running an agent.
 pub fn find_other_pane(my_pane_id: &str) -> Result<Pane> {
     let panes = list_panes()?;
     panes
         .into_iter()
-        .find(|p| p.id != my_pane_id)
-        .ok_or_else(|| eyre::eyre!("no other tmux pane found"))
+        .find(|p| {
+            p.id != my_pane_id && is_agent_pane(p)
+        })
+        .ok_or_else(|| eyre::eyre!("no claude or codex pane found — is your buddy running?"))
 }
