@@ -42,15 +42,42 @@ bud list                         List pending/in-flight requests
 bud show <id>                    Show full task content for a request
 bud spy <id>                     Peek at buddy's pane
 bud cancel <id>                  Cancel a pending request
-bud nudge <id>                   Remind buddy about a pending request
-bud retry <id>                   Reassign a request with a new ID
+bud wait <id>                    Wait for a response (default 90s timeout)
+bud wait <id> --timeout <secs>   Wait with custom timeout
+bud issues                       Sync issues to /tmp/bud-issues from cwd repo
+bud issue-create                 Process issue drafts in /tmp/bud-issues/.../new
 cat <<'EOF' | bud steer <id>     Send captain-to-buddy clarification
 cat <<'EOF' | bud update <id>    Send buddy-to-captain progress update
-cat <<'EOF' | bud assign         Assign a task (clears buddy context)
-cat <<'EOF' | bud assign --keep  Assign, keeping buddy's context
-cat <<'EOF' | bud assign --title "..."  Assign with an optional title
-cat <<'EOF' | bud respond <id>   Respond to a task (buddies use this)
+cat <<'EOF' | bud assign                 Assign a task (clears buddy context)
+cat <<'EOF' | bud assign --keep          Assign, keeping buddy's context
+cat <<'EOF' | bud assign --title "..."   Assign with an optional title
+cat <<'EOF' | bud assign --issue 42      Assign with GitHub issue context
+cat <<'EOF' | bud respond <id>           Respond to a task (buddies use this)
 ```
+
+### Bud issues workflow
+
+- `bud issues` infers the repo from `git remote origin` and syncs issues to
+  `/tmp/bud-issues/<owner>/<repo>/`.
+- Issue data layout:
+  - `all/`: one file per issue (`<number> - <title>.md`)
+  - `open/`, `closed/`: state views
+  - `by-created/`, `by-updated/`: date-based views
+  - `labels/`, `milestones/`: optional classification directories
+  - `deps/`: optional dependency graph directories
+  - `new/`: draft files for creation
+  - `.snapshots/`: stored snapshots for change detection
+- Reference files:
+  - `INDEX.md`, `DEPS.md`, `LABELS.md`, `MILESTONES.md`
+- `bud issues` also processes new issue drafts before syncing:
+  - edit/create files in `new/` using `new/TEMPLATE.md` format
+  - `bud issues` will create GitHub issues (with labels/milestones auto-created)
+  - `bud issue-create` is a manual fallback for only processing drafts
+- To assign with issue context, use:
+  - `cat <<'EOF' | bud assign --issue 42`
+  - the issue file content is injected into the assignment message with reminder text.
+- GraphQL support:
+  - dependency relationships are pulled into `DEPS.md` and optional `deps/`.
 
 The server auto-starts on first `bud assign` and auto-restarts when the
 binary changes (no manual restart needed after `cargo install`).
@@ -109,6 +136,10 @@ These are intentional choices, not bugs:
 - **Staleness-based timeout notifications**: Instead of request age, Bud samples
   buddy pane content every 30s and notifies once when a pane stays unchanged for
   2 minutes. The notification includes a pane-content dump for quick diagnosis.
+
+- **Issue sync workflow**: `bud issues` keeps issue data on disk in a fixed structure,
+  processes draft files from `new/`, can create missing labels and milestones, and
+  keeps `INDEX.md`, `DEPS.md`, `LABELS.md`, and `MILESTONES.md` for quick navigation.
 
 ## Requirements
 
