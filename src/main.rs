@@ -670,10 +670,8 @@ fn list_requests() -> Result<()> {
 }
 
 fn sync_issues_to_pane() -> Result<()> {
-    let pane = std::env::var("TMUX_PANE")
-        .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
     let repo = github::infer_repo()?;
-    eprintln!("Syncing issues for {repo} — sit tight, I'll deliver them to your pane when ready.");
+    eprintln!("Syncing issues for {repo}...");
 
     let (created, failed) = process_pending_issue_drafts(&repo)?;
 
@@ -758,7 +756,7 @@ fn sync_issues_to_pane() -> Result<()> {
         ,
         result.new_dir.display()
     ));
-    tmux::send_to_pane(&pane, &summary)?;
+    println!("{summary}");
     Ok(())
 }
 
