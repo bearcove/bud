@@ -1,6 +1,7 @@
 use eyre::Result;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -12,6 +13,7 @@ pub struct Issue {
     pub comments: Vec<Comment>,
     pub state: String,
     pub assignees: Vec<Assignee>,
+    pub milestone: Option<Milestone>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "updatedAt")]
@@ -21,6 +23,11 @@ pub struct Issue {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Label {
     pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Milestone {
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,6 +46,15 @@ pub struct Comment {
     pub body: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IssueSyncResult {
+    pub index_path: PathBuf,
+    pub open_dir: PathBuf,
+    pub all_dir: PathBuf,
+    pub open_count: usize,
+    pub closed_count: usize,
 }
 
 pub fn infer_repo() -> Result<String> {
@@ -87,7 +103,7 @@ pub fn sync_issues(repo: &str) -> Result<Vec<Issue>> {
             "-R",
             repo,
             "--json",
-            "number,title,body,labels,comments,state,assignees,createdAt,updatedAt",
+            "number,title,body,labels,comments,state,assignees,milestone,createdAt,updatedAt",
             "--limit",
             "100",
         ])
@@ -100,75 +116,256 @@ pub fn sync_issues(repo: &str) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 
-pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<(PathBuf, usize)> {
+pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult> {
     let dir_name = repo.replace('/', "-");
     let dir = PathBuf::from("/tmp/bud-issues").join(dir_name);
-    std::fs::create_dir_all(&dir)?;
-
-    for issue in issues {
-        let labels = if issue.labels.is_empty() {
-            "none".to_string()
-        } else {
-            issue.labels
-                .iter()
-                .map(|l| l.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let assignees = if issue.assignees.is_empty() {
-            "none".to_string()
-        } else {
-            issue.assignees
-                .iter()
-                .map(|a| a.login.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let body = issue.body.as_deref().unwrap_or("").trim();
-        let body = if body.is_empty() {
-            "(no description)"
-        } else {
-            body
-        };
-
-        let mut content = String::new();
-        content.push_str(&format!("# #{}: {}\n\n", issue.number, issue.title));
-        content.push_str(&format!("**State:** {}\n", issue.state));
-        content.push_str(&format!("**Labels:** {labels}\n"));
-        content.push_str(&format!("**Created:** {}\n", short_date(&issue.created_at)));
-        content.push_str(&format!("**Updated:** {}\n", short_date(&issue.updated_at)));
-        content.push_str(&format!("**Assignees:** {assignees}\n\n"));
-        content.push_str("---\n\n");
-        content.push_str(body);
-        content.push_str("\n\n---\n\n## Comments\n\n");
-        if issue.comments.is_empty() {
-            content.push_str("(no comments)\n");
-        } else {
-            for comment in &issue.comments {
-                let author = comment
-                    .author
-                    .as_ref()
-                    .map(|u| u.login.as_str())
-                    .unwrap_or("unknown");
-                let comment_body = comment.body.as_deref().unwrap_or("").trim();
-                let comment_body = if comment_body.is_empty() {
-                    "(no comment body)"
-                } else {
-                    comment_body
-                };
-                content.push_str(&format!(
-                    "### @{author} ({}):\n{comment_body}\n\n",
-                    short_date(&comment.created_at)
-                ));
-            }
-        }
-
-        std::fs::write(dir.join(format!("{}.md", issue.number)), content)?;
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
     }
 
-    Ok((dir, issues.len()))
+    let all_dir = dir.join("all");
+    let open_dir = dir.join("open");
+    let closed_dir = dir.join("closed");
+    std::fs::create_dir_all(&all_dir)?;
+    std::fs::create_dir_all(&open_dir)?;
+    std::fs::create_dir_all(&closed_dir)?;
+
+    let mut open_issues: Vec<&Issue> = Vec::new();
+    let mut closed_issues: Vec<&Issue> = Vec::new();
+
+    for issue in issues {
+        let filename = issue_filename(issue);
+        let all_path = all_dir.join(&filename);
+        std::fs::write(&all_path, render_issue(issue))?;
+
+        let link_target = format!("../all/{filename}");
+        if issue.state.eq_ignore_ascii_case("open") {
+            create_symlink(&link_target, &open_dir.join(&filename))?;
+            open_issues.push(issue);
+        } else {
+            create_symlink(&link_target, &closed_dir.join(&filename))?;
+            closed_issues.push(issue);
+        }
+    }
+
+    open_issues.sort_by(|a, b| b.number.cmp(&a.number));
+    closed_issues.sort_by(|a, b| b.number.cmp(&a.number));
+
+    let index_path = dir.join("INDEX.md");
+    std::fs::write(
+        &index_path,
+        render_index(repo, &open_issues, &closed_issues, issues),
+    )?;
+
+    Ok(IssueSyncResult {
+        index_path,
+        open_dir,
+        all_dir,
+        open_count: open_issues.len(),
+        closed_count: closed_issues.len(),
+    })
+}
+
+fn create_symlink(target: &str, link: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        if link.exists() {
+            std::fs::remove_file(link)?;
+        }
+        symlink(target, link)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, link);
+        Err(eyre::eyre!("symlink support requires unix"))
+    }
+}
+
+fn issue_filename(issue: &Issue) -> String {
+    let mut title = sanitize_title_for_filename(&issue.title);
+    if title.is_empty() {
+        title = "untitled".to_string();
+    }
+    format!("{} - {}.md", issue.number, title)
+}
+
+fn sanitize_title_for_filename(title: &str) -> String {
+    let replaced: String = title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            _ => c,
+        })
+        .collect();
+    let squashed = replaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    squashed.chars().take(80).collect::<String>().trim().to_string()
+}
+
+fn render_issue(issue: &Issue) -> String {
+    let labels = if issue.labels.is_empty() {
+        "none".to_string()
+    } else {
+        issue.labels
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let assignees = if issue.assignees.is_empty() {
+        "none".to_string()
+    } else {
+        issue.assignees
+            .iter()
+            .map(|a| a.login.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let milestone = issue
+        .milestone
+        .as_ref()
+        .map(|m| m.title.as_str())
+        .unwrap_or("none");
+    let body = issue.body.as_deref().unwrap_or("").trim();
+    let body = if body.is_empty() {
+        "(no description)"
+    } else {
+        body
+    };
+
+    let mut content = String::new();
+    content.push_str(&format!("# #{}: {}\n\n", issue.number, issue.title));
+    content.push_str(&format!("**State:** {}\n", issue.state.to_lowercase()));
+    content.push_str(&format!("**Labels:** {labels}\n"));
+    content.push_str(&format!("**Milestone:** {milestone}\n"));
+    content.push_str(&format!("**Created:** {}\n", short_date(&issue.created_at)));
+    content.push_str(&format!("**Updated:** {}\n", short_date(&issue.updated_at)));
+    content.push_str(&format!("**Assignees:** {assignees}\n\n"));
+    content.push_str("---\n\n");
+    content.push_str(body);
+    content.push_str("\n\n---\n\n## Comments\n\n");
+    if issue.comments.is_empty() {
+        content.push_str("(no comments)\n");
+    } else {
+        for comment in &issue.comments {
+            let author = comment
+                .author
+                .as_ref()
+                .map(|u| u.login.as_str())
+                .unwrap_or("unknown");
+            let comment_body = comment.body.as_deref().unwrap_or("").trim();
+            let comment_body = if comment_body.is_empty() {
+                "(no comment body)"
+            } else {
+                comment_body
+            };
+            content.push_str(&format!(
+                "### @{author} ({}):\n{comment_body}\n\n",
+                short_date(&comment.created_at)
+            ));
+        }
+    }
+    content
+}
+
+fn render_index(repo: &str, open_issues: &[&Issue], closed_issues: &[&Issue], all_issues: &[Issue]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Issues for {repo}\n\n"));
+    out.push_str(&format!("Synced: {}\n\n", today_ymd()));
+
+    out.push_str(&format!("## Open ({})\n\n", open_issues.len()));
+    for issue in open_issues {
+        let filename = issue_filename(issue);
+        out.push_str(&format!(
+            "- [#{} - {}](all/{})\n",
+            issue.number,
+            issue.title,
+            encode_path_component(&filename)
+        ));
+    }
+    if open_issues.is_empty() {
+        out.push_str("- none\n");
+    }
+
+    out.push_str(&format!("\n## Closed ({})\n\n", closed_issues.len()));
+    for issue in closed_issues {
+        let filename = issue_filename(issue);
+        out.push_str(&format!(
+            "- [#{} - {}](all/{})\n",
+            issue.number,
+            issue.title,
+            encode_path_component(&filename)
+        ));
+    }
+    if closed_issues.is_empty() {
+        out.push_str("- none\n");
+    }
+
+    let has_any_milestone = all_issues.iter().any(|i| i.milestone.is_some());
+    if has_any_milestone {
+        out.push_str("\n## By Milestone\n\n");
+
+        let mut groups: BTreeMap<String, Vec<&Issue>> = BTreeMap::new();
+        for issue in all_issues {
+            let key = issue
+                .milestone
+                .as_ref()
+                .map(|m| m.title.clone())
+                .unwrap_or_else(|| "No milestone".to_string());
+            groups.entry(key).or_default().push(issue);
+        }
+
+        for issues in groups.values_mut() {
+            issues.sort_by(|a, b| b.number.cmp(&a.number));
+        }
+
+        for (milestone, issues) in groups {
+            out.push_str(&format!("### {milestone} ({} issues)\n", issues.len()));
+            for issue in issues {
+                let state = if issue.state.eq_ignore_ascii_case("open") {
+                    "open"
+                } else {
+                    "closed"
+                };
+                let filename = issue_filename(issue);
+                out.push_str(&format!(
+                    "- [#{} - {}](all/{}) ({state})\n",
+                    issue.number,
+                    issue.title,
+                    encode_path_component(&filename)
+                ));
+            }
+            out.push('\n');
+        }
+    }
+
+    out
 }
 
 fn short_date(value: &str) -> &str {
     value.get(..10).unwrap_or(value)
+}
+
+fn today_ymd() -> String {
+    let output = Command::new("date").arg("+%F").output();
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        return String::from_utf8_lossy(&output.stdout).trim().to_string();
+    }
+    "unknown".to_string()
+}
+
+fn encode_path_component(input: &str) -> String {
+    let mut out = String::new();
+    for b in input.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }

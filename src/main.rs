@@ -559,11 +559,15 @@ fn sync_issues_to_pane() -> Result<()> {
     eprintln!("Syncing issues for {repo} — sit tight, I'll deliver them to your pane when ready.");
 
     let issues = github::sync_issues(&repo)?;
-    let (dir, count) = github::write_issue_files(&repo, &issues)?;
+    let result = github::write_issue_files(&repo, &issues)?;
 
     let summary = format!(
-        "GitHub issues sync complete for {repo}.\nSaved {count} issue files to: {}\nYou can browse them directly in this directory.",
-        dir.display()
+        "Issues synced for {repo} — {} open, {} closed.\nBrowse: {}\nOpen issues: {}\nAll issues: {}",
+        result.open_count,
+        result.closed_count,
+        result.index_path.display(),
+        result.open_dir.display(),
+        result.all_dir.display()
     );
     tmux::send_to_pane(&pane, &summary)?;
     Ok(())
