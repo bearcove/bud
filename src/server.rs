@@ -21,7 +21,7 @@ struct CoopServer {
 }
 
 impl crate::protocol::Coop for CoopServer {
-    async fn assign(&self, req: crate::protocol::AssignRequest) -> String {
+    async fn assign(&self, req: crate::protocol::AssignRequest) -> Result<String, String> {
         let crate::protocol::AssignRequest {
             source_pane,
             content,
@@ -34,7 +34,7 @@ impl crate::protocol::Coop for CoopServer {
         // Write the task content to a file
         if let Err(e) = std::fs::write(&task_file, &content) {
             error!("failed to write task file {}: {e}", task_file.display());
-            return format!("ERROR: {e}");
+            return Err(e.to_string());
         }
 
         // Find the other pane to send to
@@ -42,7 +42,7 @@ impl crate::protocol::Coop for CoopServer {
             Ok(p) => p,
             Err(e) => {
                 error!("failed to find worker pane: {e}");
-                return format!("ERROR: {e}");
+                return Err(e.to_string());
             }
         };
 
@@ -61,15 +61,15 @@ impl crate::protocol::Coop for CoopServer {
         }
 
         let message = format!(
-            "🌱 Hey! A buddy of yours needs help with something — your assistance \
-             is much appreciated and they'll be very thankful.\n\n\
-             🌱 The full assignment is at: {}\n\
+            "{}\n\n\
+             The full assignment is at: {}\n\
              Please read it, then do your best to help.\n\n\
-             🌱 IMPORTANT: When you're done, you MUST send your response by executing \
+             IMPORTANT: When you're done, you MUST send your response by executing \
              this shell command (use your Bash/shell tool — do NOT just print it as text):\n\n\
              cat <<'BUDEOF' | bud respond {request_id}\n\
              <put your full response here>\n\
              BUDEOF",
+            crate::warmth::greeting(),
             task_file.display()
         );
 
@@ -82,7 +82,7 @@ impl crate::protocol::Coop for CoopServer {
             task_file.display(),
             target.id
         );
-        request_id
+        Ok(request_id)
     }
 }
 
@@ -182,7 +182,8 @@ async fn watch_responses(dir: PathBuf, requests: Arc<Mutex<HashMap<String, Reque
                     Err(_) => "(could not read response file)".to_string(),
                 };
                 let message = format!(
-                    "🌱 Your buddy came through! Here's their response to request {request_id}:\n{body}"
+                    "{}\n{body}",
+                    crate::warmth::delivered()
                 );
                 if let Err(e) = tmux::send_to_pane(&request.source_pane, &message) {
                     error!(

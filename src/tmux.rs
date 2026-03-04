@@ -1,5 +1,17 @@
 use eyre::Result;
+use rand::prelude::IndexedRandom;
 use std::process::Command;
+
+const EMOJI_POOL: &[&str] = &[
+    "🌵", "🍄", "🦊", "🐙", "🎯", "🔮", "🧊", "🪐", "🦑", "🎪", "🌋", "🦎", "🪸", "🧿",
+    "🫧", "🪬", "🐚", "🦩", "🪻", "🧲", "🪩", "🦠", "🫎", "🪼", "🐋", "🦚", "🪷", "🧬",
+];
+
+fn generate_marker() -> String {
+    let mut rng = rand::rng();
+    let picked: Vec<&str> = EMOJI_POOL.choose_multiple(&mut rng, 3).copied().collect();
+    picked.join("")
+}
 
 pub struct Pane {
     pub id: String,
@@ -40,12 +52,15 @@ fn capture_pane(pane_id: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Wait until the pane shows a paste indicator, meaning the text has landed.
-/// Claude Code shows "[Pasted text '" and Codex shows "[Pasted Content ".
-fn wait_for_paste(pane_id: &str) -> Result<()> {
+/// Wait until the pane shows either our emoji marker (small pastes) or a paste
+/// indicator from Claude Code / Codex (large pastes).
+fn wait_for_paste(pane_id: &str, marker: &str) -> Result<()> {
     for _ in 0..100 {
         let content = capture_pane(pane_id)?;
-        if content.contains("[Pasted text '") || content.contains("[Pasted Content ") {
+        if content.contains(marker)
+            || content.contains("[Pasted text '")
+            || content.contains("[Pasted Content ")
+        {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -54,27 +69,32 @@ fn wait_for_paste(pane_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Send text to a tmux pane. Uses -l for literal text, waits for paste indicator,
-/// then C-m to submit.
+/// Send text to a tmux pane. Prepends a unique emoji marker, waits for it to
+/// appear on screen, then submits with C-m.
 pub fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
-    // Cancel any existing input
+    let marker = generate_marker();
+    let tagged = format!("{marker} {text}\n{marker}");
+
+    // Clear any existing input (C-u kills the line without interrupting the process)
     let status = Command::new("tmux")
-        .args(["send-keys", "-t", pane_id, "C-c"])
+        .args(["send-keys", "-t", pane_id, "C-u"])
         .status()?;
     if !status.success() {
-        return Err(eyre::eyre!("tmux send-keys (C-c) failed for pane {pane_id}"));
+        return Err(eyre::eyre!("tmux send-keys (C-u) failed for pane {pane_id}"));
     }
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let status = Command::new("tmux")
-        .args(["send-keys", "-t", pane_id, "-l", text])
+        .args(["send-keys", "-t", pane_id, "-l", &tagged])
         .status()?;
     if !status.success() {
         return Err(eyre::eyre!("tmux send-keys (text) failed for pane {pane_id}"));
     }
 
-    // Wait for the paste indicator to appear on screen
-    wait_for_paste(pane_id)?;
+    // Wait for our emoji marker or a paste indicator to appear
+    wait_for_paste(pane_id, &marker)?;
+    // Let the terminal settle after paste lands
+    std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Submit with C-m (carriage return)
     let status = Command::new("tmux")

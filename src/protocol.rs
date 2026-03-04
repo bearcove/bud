@@ -13,5 +13,5 @@ pub struct AssignRequest {
 #[roam::service]
 pub trait Coop {
     /// Assign a task to the worker agent. Returns the request ID.
-    async fn assign(&self, req: AssignRequest) -> String;
+    async fn assign(&self, req: AssignRequest) -> Result<String, String>;
 }
