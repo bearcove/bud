@@ -125,6 +125,8 @@ dependencies = [
  "roam",
  "roam-stream",
  "rust-ini",
+ "serde",
+ "serde_json",
  "sysinfo",
  "tokio",
  "tracing",

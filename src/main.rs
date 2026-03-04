@@ -1,5 +1,6 @@
 mod config;
 mod discord;
+mod github;
 mod hash;
 mod protocol;
 mod server;
@@ -56,6 +57,8 @@ enum Command {
         #[facet(args::positional)]
         request_id: String,
     },
+    /// Sync GitHub issues for the current repo and write them to disk
+    Issues,
     /// Assign a task to another agent (reads from stdin)
     Assign {
         /// Keep the worker's existing context (default: clear it)
@@ -84,6 +87,7 @@ USAGE:
     bud spy <id>                     Peek at buddy's pane
     cat <<'EOF' | bud steer <id>     Steer buddy on a pending request
     cat <<'EOF' | bud update <id>    Send progress update to captain
+    bud issues                       Sync GitHub issues for current repo
     cat <<'EOF' | bud assign                 Assign a task (clears worker context)
     cat <<'EOF' | bud assign --keep          Assign, keeping worker's context
     cat <<'EOF' | bud assign --title "..."   Assign with a title
@@ -195,6 +199,7 @@ async fn main() -> Result<()> {
         Some(Command::Spy { request_id }) => spy_request(&request_id),
         Some(Command::Steer { request_id }) => steer_request(&request_id),
         Some(Command::Update { request_id }) => update_request(&request_id),
+        Some(Command::Issues) => sync_issues_to_pane(),
         Some(Command::Assign { keep, title }) => {
             let pane = std::env::var("TMUX_PANE")
                 .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
@@ -544,5 +549,22 @@ fn list_requests() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn sync_issues_to_pane() -> Result<()> {
+    let pane = std::env::var("TMUX_PANE")
+        .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
+    let repo = github::infer_repo()?;
+    eprintln!("Syncing issues for {repo} — sit tight, I'll deliver them to your pane when ready.");
+
+    let issues = github::sync_issues(&repo)?;
+    let (dir, count) = github::write_issue_files(&repo, &issues)?;
+
+    let summary = format!(
+        "GitHub issues sync complete for {repo}.\nSaved {count} issue files to: {}\nYou can browse them directly in this directory.",
+        dir.display()
+    );
+    tmux::send_to_pane(&pane, &summary)?;
     Ok(())
 }
