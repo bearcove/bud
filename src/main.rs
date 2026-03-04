@@ -361,7 +361,7 @@ fn print_request_followup_help(request_id: &str) {
         "  bud spy {request_id}                         - peek at what your buddy's pane looks like right now"
     );
     eprintln!(
-        "  bud wait {request_id}                        - block until your buddy responds (90s default)"
+        "  bud wait {request_id}                        - stream buddy updates and final response (90s default)"
     );
     eprintln!("  bud wait {request_id} --timeout 300          - block with custom timeout");
     eprintln!(
@@ -474,10 +474,16 @@ fn update_request(request_id: &str) -> Result<()> {
     let update = format!(
         "📋 Progress update from your buddy on task {request_id}{title_suffix}:\n\n{message}\n\nWhether you're happy or unhappy with this update, reply to your buddy (not the user!) with:\n\ncat <<'BUDEOF' | bud steer {request_id}\n<your reply here>\nBUDEOF\n\nThis is also a good time to commit and push your buddy's work so far.{git_section}"
     );
-    tmux::send_to_pane(&meta.source_pane, &update)?;
+    std::fs::create_dir_all(response_dir(&session_name))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let update_path =
+        response_dir(&session_name).join(format!("{request_id}.update.{timestamp}.md"));
+    std::fs::write(&update_path, &update)?;
     eprintln!(
-        "Sent progress update for task {request_id} to pane {}.",
-        meta.source_pane
+        "Queued progress update for task {request_id} at {}.",
+        update_path.display()
     );
     Ok(())
 }
@@ -772,13 +778,22 @@ fn wait_for_response(request_id: &str, timeout_secs: u64) -> Result<()> {
     }
 
     let response_path = response_dir(&session_name).join(format!("{request_id}.md"));
+    let final_path = response_dir(&session_name).join(format!("{request_id}.final.md"));
+    let update_prefix = format!("{request_id}.update.");
     let poll_interval = Duration::from_secs(2);
     let mut waited = 0u64;
     let mut next_progress = 10u64;
     let buddy_pane = util::read_request_meta(&request_path)
         .map(|meta| meta.target_pane)
         .unwrap_or_default();
+    let mut seen_updates: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    if final_path.exists() {
+        let response = std::fs::read_to_string(&final_path)?;
+        eprintln!("{response}");
+        let _ = std::fs::remove_file(&final_path);
+        return Ok(());
+    }
     if response_path.exists() {
         let response = std::fs::read_to_string(&response_path)?;
         eprintln!("{response}");
@@ -795,13 +810,54 @@ fn wait_for_response(request_id: &str, timeout_secs: u64) -> Result<()> {
         std::thread::sleep(poll_interval);
         waited += 2;
 
+        if let Ok(entries) = std::fs::read_dir(response_dir(&session_name)) {
+            let mut updates: Vec<(String, std::path::PathBuf)> = entries
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if !name.starts_with(&update_prefix) || !name.ends_with(".md") {
+                        return None;
+                    }
+                    Some((name, entry.path()))
+                })
+                .collect();
+            updates.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, update_file) in updates {
+                if seen_updates.contains(&name) {
+                    continue;
+                }
+                match std::fs::read_to_string(&update_file) {
+                    Ok(update) => {
+                        eprintln!("{update}");
+                        seen_updates.insert(name);
+                        let _ = std::fs::remove_file(&update_file);
+                    }
+                    Err(_) => {
+                        seen_updates.insert(name);
+                    }
+                }
+            }
+        }
+
+        if final_path.exists() {
+            let response = std::fs::read_to_string(&final_path)?;
+            eprintln!("{response}");
+            let _ = std::fs::remove_file(&final_path);
+            return Ok(());
+        }
         if response_path.exists() {
             let response = std::fs::read_to_string(&response_path)?;
             eprintln!("{response}");
             return Ok(());
         }
         if !request_path.exists() {
-            eprintln!("Response for {request_id} has been delivered to your pane.");
+            if final_path.exists() {
+                let response = std::fs::read_to_string(&final_path)?;
+                eprintln!("{response}");
+                let _ = std::fs::remove_file(&final_path);
+                return Ok(());
+            }
+            eprintln!("Response for {request_id} has been delivered.");
             return Ok(());
         }
 

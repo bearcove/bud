@@ -701,6 +701,12 @@ async fn process_response_files(
                 Ok(file_type) if file_type.is_file() => {}
                 _ => continue,
             }
+            let Some(filename) = response_path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if filename.contains(".update.") || filename.contains(".final.") {
+                continue;
+            }
 
             let request_id = match response_path.file_stem().and_then(|s| s.to_str()) {
                 Some(id) => id.to_string(),
@@ -781,8 +787,14 @@ async fn process_response_files(
             let message = format!(
                 "{intro}\n{body}\n\nRemember: you're the captain. If there's follow-up work, assign it to your buddy — don't do it yourself. Stay focused on the big picture!\n\nThis is also a good time to commit and push your buddy's work so far.{git_section}"
             );
-            if let Err(e) = tmux::send_to_pane(&source_pane, &message) {
-                error!("failed to deliver response to pane {}: {e}", source_pane);
+            let final_path = session_path.join(format!("{request_id}.final.md"));
+            if let Err(e) = std::fs::write(&final_path, &message) {
+                error!(
+                    "failed to write final wait response for request {} in session {} to {}: {e}",
+                    request_id,
+                    session_name,
+                    final_path.display()
+                );
                 continue;
             }
 
