@@ -2,6 +2,7 @@ mod config;
 mod discord;
 mod github;
 mod hash;
+mod pane;
 mod protocol;
 mod server;
 mod tmux;
