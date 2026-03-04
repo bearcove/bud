@@ -15,6 +15,7 @@ fn generate_marker() -> String {
 
 pub struct Pane {
     pub id: String,
+    pub pid: u32,
     pub title: String,
     pub command: String,
 }
@@ -22,7 +23,12 @@ pub struct Pane {
 /// List all tmux panes in the current session.
 pub fn list_panes() -> Result<Vec<Pane>> {
     let output = Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}\t#{pane_current_command}"])
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}\t#{pane_pid}\t#{pane_title}\t#{pane_current_command}",
+        ])
         .output()?;
 
     if !output.status.success() {
@@ -33,11 +39,17 @@ pub fn list_panes() -> Result<Vec<Pane>> {
     let panes = stdout
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
+            let mut parts = line.splitn(4, '\t');
             let id = parts.next()?.to_string();
+            let pid = parts.next()?.parse().ok()?;
             let title = parts.next()?.to_string();
             let command = parts.next()?.to_string();
-            Some(Pane { id, title, command })
+            Some(Pane {
+                id,
+                pid,
+                title,
+                command,
+            })
         })
         .collect();
 
@@ -108,9 +120,16 @@ pub fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
 }
 
 fn is_agent_pane(p: &Pane) -> bool {
-    // Claude Code: pane_title contains "Claude Code" exactly
-    // Codex: pane_current_command starts with "codex-"
-    p.title.contains("Claude Code") || p.command.starts_with("codex-")
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let mut sys = System::new();
+    let parent = Pid::from_u32(p.pid);
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+
+    sys.processes().values().any(|proc| {
+        proc.parent() == Some(parent)
+            && matches!(proc.name().to_str(), Some("claude" | "codex"))
+    })
 }
 
 /// Find a pane that is NOT the given pane_id and is running an agent.

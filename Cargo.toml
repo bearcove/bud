@@ -14,3 +14,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.9"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
