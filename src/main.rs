@@ -564,14 +564,17 @@ fn sync_issues_to_pane() -> Result<()> {
 
     let issues = github::sync_issues(&repo)?;
     let result = github::write_issue_files(&repo, &issues)?;
+    std::fs::write(result.base_dir.join(".pane"), &pane)?;
 
     let mut summary = format!(
-        "Issues synced for {repo} — {} open, {} closed.\n\n  Browse all:       ls {}/\n  Browse open:      ls {}/\n  Browse closed:    ls {}/",
+        "Issues synced for {repo} — {} open, {} closed.\n\n  Browse all:       ls {}/\n  Browse open:      ls {}/\n  Browse closed:    ls {}/\n  By created date:  ls {}/\n  By updated date:  ls {}/",
         result.open_count,
         result.closed_count,
         result.all_dir.display(),
         result.open_dir.display(),
         result.closed_dir.display(),
+        result.by_created_dir.display(),
+        result.by_updated_dir.display(),
     );
     if let Some(labels_dir) = result.labels_dir.as_ref() {
         summary.push_str(&format!("\n  Browse by label:  ls {}/", labels_dir.display()));
@@ -586,7 +589,7 @@ fn sync_issues_to_pane() -> Result<()> {
         summary.push_str(&format!("\n  Browse deps:      ls {}/", deps_dir.display()));
     }
     summary.push_str(&format!(
-        "\n  Read the index:   cat {}\n  Read deps:        cat {}\n  Read labels:      cat {}\n  Read milestones:  cat {}\n  Read an issue:    cat {}/all/<filename>.md\n  Create an issue:  Write to {}/<name>.md then run: bud issue-create\n\nPick an issue to work on, then assign it to your captain with: bud assign",
+        "\n  Read the index:   cat {}\n  Read deps:        cat {}\n  Read labels:      cat {}\n  Read milestones:  cat {}\n  Read an issue:    cat {}/all/<filename>.md\n  Create an issue:  Write to {}/<name>.md (auto-created by server, or run: bud issue-create)\n\nPick an issue to work on, then assign it to your captain with: bud assign",
         result.index_path.display(),
         result.deps_markdown_path.display(),
         result.labels_markdown_path.display(),

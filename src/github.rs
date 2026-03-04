@@ -81,6 +81,8 @@ pub struct IssueSyncResult {
     pub index_path: PathBuf,
     pub open_dir: PathBuf,
     pub closed_dir: PathBuf,
+    pub by_created_dir: PathBuf,
+    pub by_updated_dir: PathBuf,
     pub labels_dir: Option<PathBuf>,
     pub milestones_dir: Option<PathBuf>,
     pub deps_path: Option<PathBuf>,
@@ -120,7 +122,7 @@ pub fn infer_repo() -> Result<String> {
 }
 
 pub fn issue_repo_dir(repo: &str) -> PathBuf {
-    PathBuf::from("/tmp/bud-issues").join(repo.replace('/', "-"))
+    PathBuf::from("/tmp/bud-issues").join(repo)
 }
 
 pub fn sync_issues(repo: &str) -> Result<Vec<Issue>> {
@@ -267,10 +269,14 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
     let all_dir = dir.join("all");
     let open_dir = dir.join("open");
     let closed_dir = dir.join("closed");
+    let by_created_dir = dir.join("by-created");
+    let by_updated_dir = dir.join("by-updated");
     let new_dir = dir.join("new");
     std::fs::create_dir_all(&all_dir)?;
     std::fs::create_dir_all(&open_dir)?;
     std::fs::create_dir_all(&closed_dir)?;
+    std::fs::create_dir_all(&by_created_dir)?;
+    std::fs::create_dir_all(&by_updated_dir)?;
     std::fs::create_dir_all(&new_dir)?;
     std::fs::write(new_dir.join("TEMPLATE.md"), NEW_ISSUE_TEMPLATE)?;
 
@@ -291,6 +297,28 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
             create_symlink(&link_target, &closed_dir.join(&filename))?;
             closed_issues.push(issue);
         }
+
+        let created_link_name = format!(
+            "{} #{} - {}.md",
+            short_date(&issue.created_at),
+            issue.number,
+            sanitize_title_for_filename(&issue.title)
+        );
+        create_symlink(
+            &format!("../../all/{filename}"),
+            &by_created_dir.join(created_link_name),
+        )?;
+
+        let updated_link_name = format!(
+            "{} #{} - {}.md",
+            short_date(&issue.updated_at),
+            issue.number,
+            sanitize_title_for_filename(&issue.title)
+        );
+        create_symlink(
+            &format!("../../all/{filename}"),
+            &by_updated_dir.join(updated_link_name),
+        )?;
     }
 
     let has_any_labels = issues.iter().any(|issue| !issue.labels.is_empty());
@@ -358,6 +386,8 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
         index_path,
         open_dir,
         closed_dir,
+        by_created_dir,
+        by_updated_dir,
         labels_dir,
         milestones_dir,
         deps_path,
