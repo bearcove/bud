@@ -173,8 +173,11 @@ async fn watch_responses(dir: PathBuf, requests: Arc<Mutex<HashMap<String, Reque
                 None => continue,
             };
 
-            let mut reqs = requests.lock().await;
-            if let Some(request) = reqs.remove(&request_id) {
+            let request = {
+                let mut reqs = requests.lock().await;
+                reqs.remove(&request_id)
+            };
+            if let Some(request) = request {
                 seen.insert(path.clone());
 
                 let body = match std::fs::read_to_string(&path) {

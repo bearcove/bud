@@ -22,9 +22,9 @@ enum Command {
     Server,
     /// Assign a task to another agent (reads from stdin)
     Assign {
-        /// Clear the worker's context before sending the task
+        /// Keep the worker's existing context (default: clear it)
         #[facet(args::named)]
-        clear: bool,
+        keep: bool,
     },
     /// Respond to a task (reads from stdin)
     Respond {
@@ -39,8 +39,8 @@ const MANUAL: &str = r#"bud - cooperative agents over tmux
 USAGE:
     bud                              Show this manual
     bud server                       Start the server (usually auto-started)
-    cat <<'EOF' | bud assign         Assign a task (reads stdin)
-    cat <<'EOF' | bud assign --clear Assign with fresh context
+    cat <<'EOF' | bud assign         Assign a task (clears worker context)
+    cat <<'EOF' | bud assign --keep  Assign, keeping worker's context
     cat <<'EOF' | bud respond <id>   Respond to a task (reads stdin)
 
 EXAMPLES:
@@ -103,12 +103,12 @@ async fn main() -> Result<()> {
             server::run_server(socket_path(), pid_path(), response_dir(), task_dir(), log_path())
                 .await
         }
-        Some(Command::Assign { clear }) => {
+        Some(Command::Assign { keep }) => {
             let pane = std::env::var("TMUX_PANE")
                 .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
             let content = read_stdin()?;
             ensure_server_running().await?;
-            client_assign(pane, content, clear).await
+            client_assign(pane, content, !keep).await
         }
         Some(Command::Respond { request_id }) => {
             let content = read_stdin()?;
