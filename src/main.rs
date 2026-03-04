@@ -60,6 +60,12 @@ enum Command {
         #[facet(args::positional)]
         request_id: String,
     },
+    /// Send a progress update to the captain (reads from stdin)
+    Update {
+        /// The request ID to update
+        #[facet(args::positional)]
+        request_id: String,
+    },
     /// Assign a task to another agent (reads from stdin)
     Assign {
         /// Keep the worker's existing context (default: clear it)
@@ -89,6 +95,7 @@ USAGE:
     bud show <id>                    Show full task content for a request
     bud spy <id>                     Peek at buddy's pane
     cat <<'EOF' | bud steer <id>     Steer buddy on a pending request
+    cat <<'EOF' | bud update <id>    Send progress update to captain
     cat <<'EOF' | bud assign                 Assign a task (clears worker context)
     cat <<'EOF' | bud assign --keep          Assign, keeping worker's context
     cat <<'EOF' | bud assign --title "..."   Assign with a title
@@ -167,6 +174,7 @@ async fn main() -> Result<()> {
         Some(Command::Show { request_id }) => show_request(&request_id),
         Some(Command::Spy { request_id }) => spy_request(&request_id),
         Some(Command::Steer { request_id }) => steer_request(&request_id),
+        Some(Command::Update { request_id }) => update_request(&request_id),
         Some(Command::Assign { keep, title }) => {
             let pane = std::env::var("TMUX_PANE")
                 .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
@@ -337,6 +345,28 @@ fn steer_request(request_id: &str) -> Result<()> {
     eprintln!(
         "Sent steer update for task {request_id} to pane {}.",
         meta.target_pane
+    );
+    Ok(())
+}
+
+fn update_request(request_id: &str) -> Result<()> {
+    validate_request_id(request_id)?;
+    let message = read_stdin()?;
+    let path = request_dir().join(request_id);
+    let meta = util::read_request_meta(&path)
+        .ok_or_else(|| eyre::eyre!("No task with ID {request_id} found."))?;
+    let title_suffix = meta
+        .title
+        .as_deref()
+        .map(|title| format!(" ({title})"))
+        .unwrap_or_default();
+    let update = format!(
+        "📋 Progress update from your buddy on task {request_id}{title_suffix}:\n\n{message}"
+    );
+    tmux::send_to_pane(&meta.source_pane, &update)?;
+    eprintln!(
+        "Sent progress update for task {request_id} to pane {}.",
+        meta.source_pane
     );
     Ok(())
 }
