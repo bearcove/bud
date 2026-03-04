@@ -609,17 +609,16 @@ fn list_requests() -> Result<()> {
     eprintln!();
     match tmux::list_all_panes() {
         Ok(panes) => {
-            eprintln!("SESSION              PANE       AGENT    STATE    CONTEXT            ACTIVITY");
-            eprintln!(
-                "-------------------  ---------  -------  -------  -----------------  ----------------------------------------"
-            );
-            for p in panes {
+            let mut agent_rows: Vec<(String, String, String, String, String, String)> = Vec::new();
+            for p in &panes {
                 let capture = tmux::capture_pane(&p.id).unwrap_or_default();
                 let parsed = pane::parse_pane_content(&capture);
-                let agent = match parsed.agent_type {
-                    Some(pane::AgentType::Claude) => "Claude",
-                    Some(pane::AgentType::Codex) => "Codex",
-                    None => "Unknown",
+                let Some(agent_type) = parsed.agent_type else {
+                    continue;
+                };
+                let agent = match agent_type {
+                    pane::AgentType::Claude => "Claude",
+                    pane::AgentType::Codex => "Codex",
                 };
                 let state = match parsed.state {
                     pane::AgentState::Working => "Working",
@@ -631,10 +630,29 @@ fn list_requests() -> Result<()> {
                     .activity
                     .map(|value| value.replace('\n', " "))
                     .unwrap_or_else(|| "-".to_string());
+                agent_rows.push((
+                    p.session_name.clone(),
+                    p.id.clone(),
+                    agent.to_string(),
+                    state.to_string(),
+                    context,
+                    activity,
+                ));
+            }
+
+            if agent_rows.is_empty() {
+                eprintln!("No agent panes detected.");
+            } else {
+                eprintln!("SESSION              PANE       AGENT    STATE    CONTEXT            ACTIVITY");
                 eprintln!(
-                    "{:<19}  {:<9}  {:<7}  {:<7}  {:<17}  {}",
-                    p.session_name, p.id, agent, state, context, activity
+                    "-------------------  ---------  -------  -------  -----------------  ----------------------------------------"
                 );
+                for (session, pane_id, agent, state, context, activity) in agent_rows {
+                    eprintln!(
+                        "{:<19}  {:<9}  {:<7}  {:<7}  {:<17}  {}",
+                        session, pane_id, agent, state, context, activity
+                    );
+                }
             }
         }
         Err(e) => {
@@ -753,6 +771,9 @@ fn wait_for_response(request_id: &str, timeout_secs: u64) -> Result<()> {
     let poll_interval = Duration::from_secs(2);
     let mut waited = 0u64;
     let mut next_progress = 10u64;
+    let buddy_pane = util::read_request_meta(&request_path)
+        .map(|meta| meta.target_pane)
+        .unwrap_or_default();
 
     if response_path.exists() {
         let response = std::fs::read_to_string(&response_path)?;
@@ -781,7 +802,35 @@ fn wait_for_response(request_id: &str, timeout_secs: u64) -> Result<()> {
         }
 
         if waited >= next_progress {
-            eprintln!("Waiting for response... ({waited}s)");
+            let status_suffix = if buddy_pane.is_empty() {
+                String::new()
+            } else {
+                let capture = tmux::capture_pane(&buddy_pane).unwrap_or_default();
+                let parsed = pane::parse_pane_content(&capture);
+                if let Some(agent_type) = parsed.agent_type {
+                    let agent = match agent_type {
+                        pane::AgentType::Claude => "Claude",
+                        pane::AgentType::Codex => "Codex",
+                    };
+                    let state = match parsed.state {
+                        pane::AgentState::Working => "Working",
+                        pane::AgentState::Idle => "Idle",
+                        pane::AgentState::Unknown => "Unknown",
+                    };
+                    let context = parsed.context_remaining.unwrap_or_else(|| "-".to_string());
+                    let mut suffix = format!(" · {agent} · {state} · {context}");
+                    if let Some(activity) = parsed.activity {
+                        let activity = activity.replace('\n', " ");
+                        if !activity.trim().is_empty() {
+                            suffix.push_str(&format!(" · {activity}"));
+                        }
+                    }
+                    suffix
+                } else {
+                    " · Unknown".to_string()
+                }
+            };
+            eprintln!("Waiting for response... ({waited}s){status_suffix}");
             next_progress += 10;
         }
     }
