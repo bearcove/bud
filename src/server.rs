@@ -4,7 +4,6 @@ use eyre::Result;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use roam_stream::StreamLink;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -57,7 +56,8 @@ impl crate::protocol::Coop for CoopServer {
             .await
             .insert(request_id.clone(), Request { source_pane: source_pane.clone(), title });
         let request_path = self.request_dir.join(&request_id);
-        let request_file_contents = serialize_request_file(&source_pane, title_for_file.as_deref());
+        let request_file_contents =
+            crate::util::serialize_request_file(&source_pane, title_for_file.as_deref());
         if let Err(e) = std::fs::write(&request_path, request_file_contents) {
             self.requests.lock().await.remove(&request_id);
             return Err(format!(
@@ -250,8 +250,8 @@ async fn watch_responses(
 }
 
 fn run_timeout_checks(
-    request_dir: &Path,
-    response_dir: &Path,
+    request_dir: &std::path::Path,
+    response_dir: &std::path::Path,
     timeout_notified: &mut HashSet<String>,
 ) {
     let mut active_request_ids: HashSet<String> = HashSet::new();
@@ -293,7 +293,7 @@ fn run_timeout_checks(
                 continue;
             }
 
-            let (source_pane, title) = match parse_request_file(&path) {
+            let (source_pane, title) = match crate::util::parse_request_file(&path) {
                 Some(request) => request,
                 None => continue,
             };
@@ -303,7 +303,7 @@ fn run_timeout_checks(
                     .as_deref()
                     .map(|title| format!(" ({title})"))
                     .unwrap_or_default(),
-                format_age(age),
+                crate::util::format_age(age),
             );
             if let Err(e) = tmux::send_to_pane(&source_pane, &message) {
                 error!(
@@ -320,8 +320,8 @@ fn run_timeout_checks(
 }
 
 async fn process_response_files(
-    response_dir: &Path,
-    request_dir: &Path,
+    response_dir: &std::path::Path,
+    request_dir: &std::path::Path,
     requests: &Arc<Mutex<HashMap<String, Request>>>,
     timeout_notified: &mut HashSet<String>,
 ) {
@@ -345,7 +345,7 @@ async fn process_response_files(
         let (source_pane, title) = if let Some(request) = in_memory_request {
             (request.source_pane, request.title)
         } else {
-            match parse_request_file(&request_path) {
+            match crate::util::parse_request_file(&request_path) {
                 Some(request) => request,
                 None => continue,
             }
@@ -382,39 +382,4 @@ async fn process_response_files(
 
         info!("delivered response for request {request_id}");
     }
-}
-
-fn format_age(age: Duration) -> String {
-    let secs = age.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3_600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h", secs / 3_600)
-    } else {
-        format!("{}d", secs / 86_400)
-    }
-}
-
-fn serialize_request_file(source_pane: &str, title: Option<&str>) -> String {
-    match title {
-        Some(title) if !title.trim().is_empty() => format!("{source_pane}\n{}", title.trim()),
-        _ => source_pane.to_string(),
-    }
-}
-
-fn parse_request_file(path: &std::path::Path) -> Option<(String, Option<String>)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut lines = content.lines();
-    let source_pane = lines.next()?.trim().to_string();
-    if source_pane.is_empty() {
-        return None;
-    }
-    let title = lines
-        .next()
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .map(ToString::to_string);
-    Some((source_pane, title))
 }

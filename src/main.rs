@@ -2,6 +2,7 @@ mod hash;
 mod protocol;
 mod server;
 mod tmux;
+mod util;
 mod warmth;
 
 use eyre::Result;
@@ -259,7 +260,7 @@ fn list_requests() -> Result<()> {
         }
 
         let id = entry.file_name().to_string_lossy().to_string();
-        let (source_pane, title) = parse_request_file(&entry.path())
+        let (source_pane, title) = util::parse_request_file(&entry.path())
             .unwrap_or_else(|| ("(unreadable)".to_string(), None));
 
         let age = entry
@@ -267,7 +268,7 @@ fn list_requests() -> Result<()> {
             .ok()
             .and_then(|meta| meta.created().ok().or_else(|| meta.modified().ok()))
             .and_then(|timestamp| now.duration_since(timestamp).ok())
-            .map(format_age)
+            .map(util::format_age)
             .unwrap_or_else(|| "unknown".to_string());
 
         let response_exists = if response_dir.join(format!("{id}.md")).exists() {
@@ -309,32 +310,4 @@ fn list_requests() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn format_age(age: std::time::Duration) -> String {
-    let secs = age.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3_600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h", secs / 3_600)
-    } else {
-        format!("{}d", secs / 86_400)
-    }
-}
-
-fn parse_request_file(path: &std::path::Path) -> Option<(String, Option<String>)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut lines = content.lines();
-    let source_pane = lines.next()?.trim().to_string();
-    if source_pane.is_empty() {
-        return None;
-    }
-    let title = lines
-        .next()
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .map(ToString::to_string);
-    Some((source_pane, title))
 }
