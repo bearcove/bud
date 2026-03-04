@@ -95,7 +95,7 @@ fn wait_for_paste(pane_id: &str, marker: &str) -> Result<()> {
 /// appear on screen, then submits with C-m.
 pub fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
     let marker = generate_marker();
-    let tagged = format!("{marker} {text}\n{marker}");
+    let tagged = format!("{marker} {text}");
 
     // Clear any existing input (C-u kills the line without interrupting the process)
     let status = Command::new("tmux")
