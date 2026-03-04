@@ -42,6 +42,12 @@ enum Command {
         #[facet(args::positional)]
         request_id: String,
     },
+    /// Steer a buddy on an in-flight request (reads from stdin)
+    Steer {
+        /// The request ID to steer
+        #[facet(args::positional)]
+        request_id: String,
+    },
     /// Assign a task to another agent (reads from stdin)
     Assign {
         /// Keep the worker's existing context (default: clear it)
@@ -68,6 +74,7 @@ USAGE:
     bud cancel <id>                  Cancel a pending request
     bud nudge <id>                   Remind buddy about a pending request
     bud retry <id>                   Reassign a request with a new ID
+    cat <<'EOF' | bud steer <id>     Steer buddy on a pending request
     cat <<'EOF' | bud assign                 Assign a task (clears worker context)
     cat <<'EOF' | bud assign --keep          Assign, keeping worker's context
     cat <<'EOF' | bud assign --title "..."   Assign with a title
@@ -143,6 +150,7 @@ async fn main() -> Result<()> {
         Some(Command::Cancel { request_id }) => cancel_request(&request_id),
         Some(Command::Nudge { request_id }) => nudge_request(&request_id),
         Some(Command::Retry { request_id }) => retry_request(&request_id).await,
+        Some(Command::Steer { request_id }) => steer_request(&request_id),
         Some(Command::Assign { keep, title }) => {
             let pane = std::env::var("TMUX_PANE")
                 .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
@@ -208,20 +216,22 @@ async fn client_assign(source_pane: String, content: String, clear: bool, title:
     let binary_hash = hash::binary_hash();
 
     match assign_once(&source_pane, &content, clear, title.clone(), &binary_hash).await {
-        Ok(_) => {
+        Ok(request_id) => {
             eprintln!("{}", warmth::assigned());
+            print_steer_hint(&request_id);
             Ok(())
         }
         Err(first_error) => {
             eprintln!("bud: assign failed: {first_error:?}");
             ensure_server_running().await?;
-            assign_once(&source_pane, &content, clear, title, &binary_hash)
+            let request_id = assign_once(&source_pane, &content, clear, title, &binary_hash)
                 .await
                 .map_err(|e| {
                     eprintln!("bud: assign failed after retry: {e:?}");
                     eyre::eyre!("assign failed after retry: {e:?}")
                 })?;
             eprintln!("{}", warmth::assigned());
+            print_steer_hint(&request_id);
             Ok(())
         }
     }
@@ -268,6 +278,12 @@ fn validate_request_id(request_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn print_steer_hint(request_id: &str) {
+    eprintln!(
+        "If you need to give additional direction, use: cat <<'EOF' | bud steer {request_id}\n"
+    );
+}
+
 fn cancel_request(request_id: &str) -> Result<()> {
     validate_request_id(request_id)?;
     let path = request_dir().join(request_id);
@@ -294,6 +310,23 @@ fn nudge_request(request_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn steer_request(request_id: &str) -> Result<()> {
+    validate_request_id(request_id)?;
+    let path = request_dir().join(request_id);
+    let meta = util::read_request_meta(&path)
+        .ok_or_else(|| eyre::eyre!("No task with ID {request_id} found."))?;
+    let message = read_stdin()?;
+    let steer = format!(
+        "📌 Update from the captain on task {request_id}:\n\n{message}"
+    );
+    tmux::send_to_pane(&meta.target_pane, &steer)?;
+    eprintln!(
+        "Sent steer update for task {request_id} to pane {}.",
+        meta.target_pane
+    );
+    Ok(())
+}
+
 async fn retry_request(request_id: &str) -> Result<()> {
     validate_request_id(request_id)?;
     let path = request_dir().join(request_id);
@@ -316,6 +349,7 @@ async fn retry_request(request_id: &str) -> Result<()> {
     )
     .await?;
     eprintln!("Retried task {request_id} as {new_request_id}.");
+    print_steer_hint(&new_request_id);
     Ok(())
 }
 
