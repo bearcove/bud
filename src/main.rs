@@ -404,7 +404,7 @@ fn update_request(request_id: &str) -> Result<()> {
         .map(|title| format!(" ({title})"))
         .unwrap_or_default();
     let update = format!(
-        "📋 Progress update from your buddy on task {request_id}{title_suffix}:\n\n{message}\n\nTo reply to your buddy about this, use:\n\ncat <<'BUDEOF' | bud steer {request_id}\n<your reply here>\nBUDEOF"
+        "📋 Progress update from your buddy on task {request_id}{title_suffix}:\n\n{message}\n\nWhether you're happy or unhappy with this update, reply to your buddy (not the user!) with:\n\ncat <<'BUDEOF' | bud steer {request_id}\n<your reply here>\nBUDEOF\n\nThis is also a good time to commit and push your buddy's work so far."
     );
     tmux::send_to_pane(&meta.source_pane, &update)?;
     eprintln!(
