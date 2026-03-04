@@ -59,6 +59,8 @@ enum Command {
     },
     /// Sync GitHub issues for the current repo and write them to disk
     Issues,
+    /// Create GitHub issues from markdown files in the synced new/ folder
+    IssueCreate,
     /// Assign a task to another agent (reads from stdin)
     Assign {
         /// Keep the worker's existing context (default: clear it)
@@ -88,6 +90,7 @@ USAGE:
     cat <<'EOF' | bud steer <id>     Steer buddy on a pending request
     cat <<'EOF' | bud update <id>    Send progress update to captain
     bud issues                       Sync GitHub issues for current repo
+    bud issue-create                 Create issues from new/*.md drafts
     cat <<'EOF' | bud assign                 Assign a task (clears worker context)
     cat <<'EOF' | bud assign --keep          Assign, keeping worker's context
     cat <<'EOF' | bud assign --title "..."   Assign with a title
@@ -200,6 +203,7 @@ async fn main() -> Result<()> {
         Some(Command::Steer { request_id }) => steer_request(&request_id),
         Some(Command::Update { request_id }) => update_request(&request_id),
         Some(Command::Issues) => sync_issues_to_pane(),
+        Some(Command::IssueCreate) => issue_create_from_files(),
         Some(Command::Assign { keep, title }) => {
             let pane = std::env::var("TMUX_PANE")
                 .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
@@ -578,11 +582,143 @@ fn sync_issues_to_pane() -> Result<()> {
             milestones_dir.display()
         ));
     }
+    if let Some(deps_dir) = result.deps_path.as_ref() {
+        summary.push_str(&format!("\n  Browse deps:      ls {}/", deps_dir.display()));
+    }
     summary.push_str(&format!(
-        "\n  Read the index:   cat {}\n  Read an issue:    cat {}/all/<filename>.md\n\nPick an issue to work on, then assign it to your captain with: bud assign",
+        "\n  Read the index:   cat {}\n  Read deps:        cat {}\n  Read labels:      cat {}\n  Read milestones:  cat {}\n  Read an issue:    cat {}/all/<filename>.md\n  Create an issue:  Write to {}/<name>.md then run: bud issue-create\n\nPick an issue to work on, then assign it to your captain with: bud assign",
         result.index_path.display(),
+        result.deps_markdown_path.display(),
+        result.labels_markdown_path.display(),
+        result.milestones_markdown_path.display(),
         result.base_dir.display()
+        ,
+        result.new_dir.display()
     ));
     tmux::send_to_pane(&pane, &summary)?;
+    Ok(())
+}
+
+fn issue_create_from_files() -> Result<()> {
+    let pane = std::env::var("TMUX_PANE")
+        .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
+    let repo = github::infer_repo()?;
+    let base_dir = github::issue_repo_dir(&repo);
+    let new_dir = base_dir.join("new");
+    if !new_dir.exists() {
+        return Err(eyre::eyre!(
+            "issue drafts directory not found: {} (run `bud issues` first)",
+            new_dir.display()
+        ));
+    }
+
+    let created_dir = base_dir.join("created");
+    let failed_dir = base_dir.join("failed");
+    std::fs::create_dir_all(&created_dir)?;
+    std::fs::create_dir_all(&failed_dir)?;
+
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&new_dir)?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_file()))
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "md"))
+        .filter(|entry| entry.file_name().to_string_lossy() != "TEMPLATE.md")
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_string());
+
+    if entries.is_empty() {
+        tmux::send_to_pane(
+            &pane,
+            &format!("No issue drafts found in {}.", new_dir.display()),
+        )?;
+        return Ok(());
+    }
+
+    let mut existing_labels = github::sync_labels_set(&repo)?;
+    let mut existing_milestones = github::sync_milestones_set(&repo)?;
+    let mut created: Vec<(u64, String)> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    for entry in entries {
+        let path = entry.path();
+        let original_name = entry.file_name().to_string_lossy().to_string();
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                move_file(&path, &failed_dir.join(&original_name))?;
+                failed.push((original_name, format!("read failed: {e}")));
+                continue;
+            }
+        };
+
+        let draft = match github::parse_new_issue(&content) {
+            Ok(issue) => issue,
+            Err(e) => {
+                move_file(&path, &failed_dir.join(&original_name))?;
+                failed.push((original_name, format!("parse failed: {e}")));
+                continue;
+            }
+        };
+
+        let mut prep_error: Option<String> = None;
+        for label in &draft.labels {
+            if existing_labels.contains(label) {
+                continue;
+            }
+            if let Err(e) = github::ensure_label_exists(&repo, label) {
+                prep_error = Some(format!("label '{label}' creation failed: {e}"));
+                break;
+            }
+            existing_labels.insert(label.clone());
+        }
+        if prep_error.is_none()
+            && let Some(milestone) = draft.milestone.as_deref()
+            && !existing_milestones.contains(milestone)
+        {
+            if let Err(e) = github::ensure_milestone_exists(&repo, milestone) {
+                prep_error = Some(format!("milestone '{milestone}' creation failed: {e}"));
+            } else {
+                existing_milestones.insert(milestone.to_string());
+            }
+        }
+
+        if let Some(error_message) = prep_error {
+            move_file(&path, &failed_dir.join(&original_name))?;
+            failed.push((original_name, error_message));
+            continue;
+        }
+
+        match github::create_issue(&repo, &draft) {
+            Ok(number) => {
+                let filename = github::issue_filename_for_number_title(number, &draft.title);
+                move_file(&path, &created_dir.join(&filename))?;
+                created.push((number, draft.title));
+            }
+            Err(e) => {
+                move_file(&path, &failed_dir.join(&original_name))?;
+                failed.push((original_name, format!("create failed: {e}")));
+            }
+        }
+    }
+
+    let mut summary = format!(
+        "Issue creation complete for {repo}.\nCreated: {}\nFailed: {}",
+        created.len(),
+        failed.len()
+    );
+    for (number, title) in &created {
+        summary.push_str(&format!("\nCreated issue #{number}: {title}"));
+    }
+    for (name, error) in &failed {
+        summary.push_str(&format!("\nFailed {name}: {error}"));
+    }
+    tmux::send_to_pane(&pane, &summary)?;
+    Ok(())
+}
+
+fn move_file(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    if to.exists() {
+        std::fs::remove_file(to)?;
+    }
+    std::fs::rename(from, to)?;
     Ok(())
 }

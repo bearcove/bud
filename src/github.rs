@@ -1,6 +1,7 @@
 use eyre::Result;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -26,6 +27,13 @@ pub struct Label {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RepoLabel {
+    pub name: String,
+    pub description: Option<String>,
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Milestone {
     pub title: String,
 }
@@ -48,6 +56,25 @@ pub struct Comment {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct IssueRelationships {
+    pub blocked_by: Vec<u64>,
+    pub blocking: Vec<u64>,
+    pub parent: Option<u64>,
+    pub sub_issues: Vec<u64>,
+    pub tracked_in: Vec<u64>,
+    pub tracked_issues: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewIssue {
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+    pub milestone: Option<String>,
+    pub assignees: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct IssueSyncResult {
     pub base_dir: PathBuf,
@@ -56,10 +83,26 @@ pub struct IssueSyncResult {
     pub closed_dir: PathBuf,
     pub labels_dir: Option<PathBuf>,
     pub milestones_dir: Option<PathBuf>,
+    pub deps_path: Option<PathBuf>,
+    pub deps_markdown_path: PathBuf,
+    pub labels_markdown_path: PathBuf,
+    pub milestones_markdown_path: PathBuf,
     pub all_dir: PathBuf,
+    pub new_dir: PathBuf,
     pub open_count: usize,
     pub closed_count: usize,
 }
+
+const NEW_ISSUE_TEMPLATE: &str = r#"# Issue title here
+
+**Labels:** label1, label2
+**Milestone:** milestone name
+**Assignees:** username1, username2
+
+---
+
+Issue body goes here. Describe the problem or feature request.
+"#;
 
 pub fn infer_repo() -> Result<String> {
     let output = Command::new("git")
@@ -76,27 +119,8 @@ pub fn infer_repo() -> Result<String> {
     parse_repo_from_remote(&raw)
 }
 
-fn parse_repo_from_remote(remote: &str) -> Result<String> {
-    let path = if let Some((_, rest)) = remote.split_once("github.com:") {
-        rest
-    } else if let Some((_, rest)) = remote.split_once("github.com/") {
-        rest
-    } else {
-        return Err(eyre::eyre!(
-            "unsupported remote URL format for GitHub: {remote}"
-        ));
-    };
-
-    let cleaned = path.trim().trim_start_matches('/').trim_end_matches(".git");
-    let mut parts = cleaned.split('/');
-    let owner = parts.next().unwrap_or_default();
-    let repo = parts.next().unwrap_or_default();
-    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
-        return Err(eyre::eyre!(
-            "could not parse owner/repo from remote URL: {remote}"
-        ));
-    }
-    Ok(format!("{owner}/{repo}"))
+pub fn issue_repo_dir(repo: &str) -> PathBuf {
+    PathBuf::from("/tmp/bud-issues").join(repo.replace('/', "-"))
 }
 
 pub fn sync_issues(repo: &str) -> Result<Vec<Issue>> {
@@ -120,9 +144,122 @@ pub fn sync_issues(repo: &str) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 
+pub fn sync_labels(repo: &str) -> Result<Vec<RepoLabel>> {
+    let output = Command::new("gh")
+        .args([
+            "label",
+            "list",
+            "-R",
+            repo,
+            "--json",
+            "name,description,color",
+            "--limit",
+            "100",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(eyre::eyre!("gh label list failed: {stderr}"));
+    }
+    let labels: Vec<RepoLabel> = serde_json::from_slice(&output.stdout)?;
+    Ok(labels)
+}
+
+pub fn sync_milestones(repo: &str) -> Result<Vec<String>> {
+    let (owner, name) = split_repo(repo)?;
+    let endpoint = format!("repos/{owner}/{name}/milestones");
+    let output = Command::new("gh")
+        .args(["api", &endpoint, "--jq", ".[].title"])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(eyre::eyre!("gh api milestones failed: {stderr}"));
+    }
+    let milestones = String::from_utf8(output.stdout)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    Ok(milestones)
+}
+
+pub fn fetch_issue_relationships(
+    repo: &str,
+    issue_numbers: &[u64],
+) -> Result<BTreeMap<u64, IssueRelationships>> {
+    let (owner, name) = split_repo(repo)?;
+    let mut map: BTreeMap<u64, IssueRelationships> = BTreeMap::new();
+    for &number in issue_numbers {
+        map.insert(number, IssueRelationships::default());
+    }
+    if issue_numbers.is_empty() {
+        return Ok(map);
+    }
+
+    const BATCH_SIZE: usize = 20;
+    for chunk in issue_numbers.chunks(BATCH_SIZE) {
+        let mut query = String::from("query {");
+        for number in chunk {
+            query.push_str(&format!(
+                r#"
+issue_{number}: repository(owner: "{owner}", name: "{name}") {{
+  issue(number: {number}) {{
+    blockedBy(first: 100) {{ nodes {{ number }} }}
+    blocking(first: 100) {{ nodes {{ number }} }}
+    parent {{ number }}
+    subIssues(first: 100) {{ nodes {{ number }} }}
+    trackedInIssues(first: 100) {{ nodes {{ number }} }}
+    trackedIssues(first: 100) {{ nodes {{ number }} }}
+  }}
+}}"#
+            ));
+        }
+        query.push('}');
+
+        let output = Command::new("gh")
+            .args(["api", "graphql", "-f"])
+            .arg(format!("query={query}"))
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(eyre::eyre!("gh api graphql failed: {stderr}"));
+        }
+
+        let root: Value = serde_json::from_slice(&output.stdout)?;
+        let data = root.get("data").ok_or_else(|| eyre::eyre!("graphql response missing data"))?;
+
+        for number in chunk {
+            let alias = format!("issue_{number}");
+            let issue = data
+                .get(&alias)
+                .and_then(|v| v.get("issue"))
+                .filter(|v| !v.is_null());
+            let Some(issue) = issue else {
+                continue;
+            };
+            map.insert(
+                *number,
+                IssueRelationships {
+                    blocked_by: extract_numbers(issue, "blockedBy"),
+                    blocking: extract_numbers(issue, "blocking"),
+                    parent: issue
+                        .get("parent")
+                        .and_then(|v| v.get("number"))
+                        .and_then(Value::as_u64),
+                    sub_issues: extract_numbers(issue, "subIssues"),
+                    tracked_in: extract_numbers(issue, "trackedInIssues"),
+                    tracked_issues: extract_numbers(issue, "trackedIssues"),
+                },
+            );
+        }
+    }
+
+    Ok(map)
+}
+
 pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult> {
-    let dir_name = repo.replace('/', "-");
-    let dir = PathBuf::from("/tmp/bud-issues").join(dir_name);
+    let dir = issue_repo_dir(repo);
     if dir.exists() {
         std::fs::remove_dir_all(&dir)?;
     }
@@ -130,17 +267,21 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
     let all_dir = dir.join("all");
     let open_dir = dir.join("open");
     let closed_dir = dir.join("closed");
+    let new_dir = dir.join("new");
     std::fs::create_dir_all(&all_dir)?;
     std::fs::create_dir_all(&open_dir)?;
     std::fs::create_dir_all(&closed_dir)?;
+    std::fs::create_dir_all(&new_dir)?;
+    std::fs::write(new_dir.join("TEMPLATE.md"), NEW_ISSUE_TEMPLATE)?;
 
+    let mut number_to_filename: BTreeMap<u64, String> = BTreeMap::new();
     let mut open_issues: Vec<&Issue> = Vec::new();
     let mut closed_issues: Vec<&Issue> = Vec::new();
 
     for issue in issues {
         let filename = issue_filename(issue);
-        let all_path = all_dir.join(&filename);
-        std::fs::write(&all_path, render_issue(issue))?;
+        number_to_filename.insert(issue.number, filename.clone());
+        std::fs::write(all_dir.join(&filename), render_issue(issue))?;
 
         let link_target = format!("../all/{filename}");
         if issue.state.eq_ignore_ascii_case("open") {
@@ -180,10 +321,7 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
             let filename = issue_filename(issue);
             let milestone_dir = root.join(sanitize_title_for_filename(&milestone.title));
             std::fs::create_dir_all(&milestone_dir)?;
-            create_symlink(
-                &format!("../../all/{filename}"),
-                &milestone_dir.join(&filename),
-            )?;
+            create_symlink(&format!("../../all/{filename}"), &milestone_dir.join(&filename))?;
         }
         Some(root)
     } else {
@@ -199,6 +337,22 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
         render_index(repo, &open_issues, &closed_issues, issues),
     )?;
 
+    let issue_numbers = issues.iter().map(|i| i.number).collect::<Vec<_>>();
+    let relationships = fetch_issue_relationships(repo, &issue_numbers)?;
+    let deps_markdown_path = dir.join("DEPS.md");
+    let deps_path = write_deps(repo, &dir, &deps_markdown_path, &relationships, &number_to_filename)?;
+
+    let labels_markdown_path = dir.join("LABELS.md");
+    let labels = sync_labels(repo)?;
+    std::fs::write(&labels_markdown_path, render_labels_markdown(repo, &labels))?;
+
+    let milestones_markdown_path = dir.join("MILESTONES.md");
+    let milestones = sync_milestones(repo)?;
+    std::fs::write(
+        &milestones_markdown_path,
+        render_milestones_markdown(repo, &milestones),
+    )?;
+
     Ok(IssueSyncResult {
         base_dir: dir,
         index_path,
@@ -206,10 +360,291 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
         closed_dir,
         labels_dir,
         milestones_dir,
+        deps_path,
+        deps_markdown_path,
+        labels_markdown_path,
+        milestones_markdown_path,
         all_dir,
+        new_dir,
         open_count: open_issues.len(),
         closed_count: closed_issues.len(),
     })
+}
+
+pub fn parse_new_issue(content: &str) -> Result<NewIssue> {
+    let lines: Vec<&str> = content.lines().collect();
+    let title_idx = lines
+        .iter()
+        .position(|line| !line.trim().is_empty())
+        .ok_or_else(|| eyre::eyre!("new issue file is empty"))?;
+    let title_line = lines[title_idx].trim();
+    let title = title_line
+        .strip_prefix("# ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| eyre::eyre!("new issue file must start with '# <title>'"))?
+        .to_string();
+
+    let mut labels = Vec::new();
+    let mut milestone = None;
+    let mut assignees = Vec::new();
+
+    let mut separator_idx = None;
+    let mut body_prefix: Vec<&str> = Vec::new();
+    for (idx, raw_line) in lines.iter().enumerate().skip(title_idx + 1) {
+        let line = raw_line.trim();
+        if line == "---" {
+            separator_idx = Some(idx);
+            break;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("**Labels:**") {
+            labels = split_csv(value);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("**Milestone:**") {
+            let value = value.trim();
+            if !value.is_empty() {
+                milestone = Some(value.to_string());
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("**Assignees:**") {
+            assignees = split_csv(value);
+            continue;
+        }
+        body_prefix.push(*raw_line);
+    }
+
+    let body_lines: Vec<&str> = if let Some(idx) = separator_idx {
+        lines.iter().skip(idx + 1).copied().collect()
+    } else {
+        body_prefix
+    };
+    let body = body_lines.join("\n").trim().to_string();
+
+    Ok(NewIssue {
+        title,
+        body,
+        labels,
+        milestone,
+        assignees,
+    })
+}
+
+pub fn create_issue(repo: &str, issue: &NewIssue) -> Result<u64> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["issue", "create", "-R", repo, "--title", &issue.title, "--body", &issue.body]);
+    for label in &issue.labels {
+        cmd.args(["--label", label]);
+    }
+    if let Some(milestone) = issue.milestone.as_deref() {
+        cmd.args(["--milestone", milestone]);
+    }
+    for assignee in &issue.assignees {
+        cmd.args(["--assignee", assignee]);
+    }
+
+    let output = cmd.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(eyre::eyre!("gh issue create failed: {stderr}"));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?.trim().to_string();
+    parse_issue_number_from_create_output(&stdout).ok_or_else(|| {
+        eyre::eyre!("could not parse issue number from gh issue create output: {stdout}")
+    })
+}
+
+pub fn ensure_label_exists(repo: &str, label: &str) -> Result<()> {
+    let output = Command::new("gh")
+        .args([
+            "label",
+            "create",
+            label,
+            "-R",
+            repo,
+            "--color",
+            "BFD4F2",
+            "--description",
+            "Created by bud issue-create",
+        ])
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if stderr.contains("already exists") {
+        return Ok(());
+    }
+    Err(eyre::eyre!("gh label create failed for '{label}': {}", stderr.trim()))
+}
+
+pub fn ensure_milestone_exists(repo: &str, milestone: &str) -> Result<()> {
+    let (owner, name) = split_repo(repo)?;
+    let endpoint = format!("repos/{owner}/{name}/milestones");
+    let output = Command::new("gh")
+        .args(["api", &endpoint, "-X", "POST", "-f"])
+        .arg(format!("title={milestone}"))
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if stderr.contains("already_exists") || stderr.contains("already exists") {
+        return Ok(());
+    }
+    Err(eyre::eyre!(
+        "gh milestone create failed for '{milestone}': {}",
+        stderr.trim()
+    ))
+}
+
+pub fn issue_filename_for_number_title(number: u64, title: &str) -> String {
+    let mut safe = sanitize_title_for_filename(title);
+    if safe.is_empty() {
+        safe = "untitled".to_string();
+    }
+    format!("{number} - {safe}.md")
+}
+
+fn write_deps(
+    repo: &str,
+    dir: &Path,
+    deps_markdown_path: &Path,
+    relationships: &BTreeMap<u64, IssueRelationships>,
+    number_to_filename: &BTreeMap<u64, String>,
+) -> Result<Option<PathBuf>> {
+    let mut blocked_by_lines = Vec::new();
+    let mut blocking_lines = Vec::new();
+    let mut parent_sub_lines = Vec::new();
+    let mut tracked_in_lines = Vec::new();
+
+    let mut deps_dir_created = false;
+    let deps_dir = dir.join("deps");
+
+    for (number, rel) in relationships {
+        if !rel.blocked_by.is_empty() {
+            blocked_by_lines.push(format!("#{} is blocked by: {}", number, format_numbers(&rel.blocked_by)));
+            for other in &rel.blocked_by {
+                if let Some(filename) = number_to_filename.get(number) {
+                    let target_dir = deps_dir.join(format!("blocked-by-{other}"));
+                    std::fs::create_dir_all(&target_dir)?;
+                    create_symlink(&format!("../../all/{filename}"), &target_dir.join(filename))?;
+                    deps_dir_created = true;
+                }
+            }
+        }
+        if !rel.blocking.is_empty() {
+            blocking_lines.push(format!("#{} blocks: {}", number, format_numbers(&rel.blocking)));
+            for other in &rel.blocking {
+                if let Some(filename) = number_to_filename.get(number) {
+                    let target_dir = deps_dir.join(format!("blocks-{other}"));
+                    std::fs::create_dir_all(&target_dir)?;
+                    create_symlink(&format!("../../all/{filename}"), &target_dir.join(filename))?;
+                    deps_dir_created = true;
+                }
+            }
+        }
+        if !rel.sub_issues.is_empty() {
+            parent_sub_lines.push(format!(
+                "#{number} has sub-issues: {}",
+                format_numbers(&rel.sub_issues)
+            ));
+        }
+        if let Some(parent) = rel.parent {
+            parent_sub_lines.push(format!("#{number} parent: #{parent}"));
+        }
+        if !rel.tracked_in.is_empty() {
+            tracked_in_lines.push(format!(
+                "#{number} tracked in: {}",
+                format_numbers(&rel.tracked_in)
+            ));
+        }
+        if !rel.tracked_issues.is_empty() {
+            tracked_in_lines.push(format!(
+                "#{number} tracks: {}",
+                format_numbers(&rel.tracked_issues)
+            ));
+        }
+    }
+
+    let mut deps_md = format!("# Dependencies for {repo}\n\n");
+    if !blocked_by_lines.is_empty() {
+        deps_md.push_str("## Blocked By\n");
+        for line in &blocked_by_lines {
+            deps_md.push_str(&format!("- {line}\n"));
+        }
+        deps_md.push('\n');
+    }
+    if !blocking_lines.is_empty() {
+        deps_md.push_str("## Blocking\n");
+        for line in &blocking_lines {
+            deps_md.push_str(&format!("- {line}\n"));
+        }
+        deps_md.push('\n');
+    }
+    if !parent_sub_lines.is_empty() {
+        deps_md.push_str("## Parent / Sub-Issues\n");
+        for line in &parent_sub_lines {
+            deps_md.push_str(&format!("- {line}\n"));
+        }
+        deps_md.push('\n');
+    }
+    if !tracked_in_lines.is_empty() {
+        deps_md.push_str("## Tracked In\n");
+        for line in &tracked_in_lines {
+            deps_md.push_str(&format!("- {line}\n"));
+        }
+        deps_md.push('\n');
+    }
+    std::fs::write(deps_markdown_path, deps_md)?;
+
+    Ok(if deps_dir_created { Some(deps_dir) } else { None })
+}
+
+fn render_labels_markdown(repo: &str, labels: &[RepoLabel]) -> String {
+    let mut labels = labels.to_vec();
+    labels.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    let mut out = format!("# Available Labels for {repo}\n\n");
+    if labels.is_empty() {
+        out.push_str("- (no labels)\n");
+        return out;
+    }
+    for label in labels {
+        let description = label
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .unwrap_or("No description");
+        let mut line = format!("- **{}** — {}", label.name, description);
+        if let Some(color) = label.color.as_deref()
+            && !color.trim().is_empty()
+        {
+            line.push_str(&format!(" (#{})", color.trim()));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+fn render_milestones_markdown(repo: &str, milestones: &[String]) -> String {
+    let mut milestones = milestones.to_vec();
+    milestones.sort_by_key(|m| m.to_lowercase());
+    let mut out = format!("# Available Milestones for {repo}\n\n");
+    if milestones.is_empty() {
+        out.push_str("- (no milestones)\n");
+        return out;
+    }
+    for milestone in milestones {
+        out.push_str(&format!("- {milestone}\n"));
+    }
+    out
 }
 
 fn create_symlink(target: &str, link: &Path) -> Result<()> {
@@ -230,11 +665,7 @@ fn create_symlink(target: &str, link: &Path) -> Result<()> {
 }
 
 fn issue_filename(issue: &Issue) -> String {
-    let mut title = sanitize_title_for_filename(&issue.title);
-    if title.is_empty() {
-        title = "untitled".to_string();
-    }
-    format!("{} - {}.md", issue.number, title)
+    issue_filename_for_number_title(issue.number, &issue.title)
 }
 
 fn sanitize_title_for_filename(title: &str) -> String {
@@ -274,11 +705,7 @@ fn render_issue(issue: &Issue) -> String {
         .map(|m| m.title.as_str())
         .unwrap_or("none");
     let body = issue.body.as_deref().unwrap_or("").trim();
-    let body = if body.is_empty() {
-        "(no description)"
-    } else {
-        body
-    };
+    let body = if body.is_empty() { "(no description)" } else { body };
 
     let mut content = String::new();
     content.push_str(&format!("# #{}: {}\n\n", issue.number, issue.title));
@@ -315,7 +742,12 @@ fn render_issue(issue: &Issue) -> String {
     content
 }
 
-fn render_index(repo: &str, open_issues: &[&Issue], closed_issues: &[&Issue], all_issues: &[Issue]) -> String {
+fn render_index(
+    repo: &str,
+    open_issues: &[&Issue],
+    closed_issues: &[&Issue],
+    all_issues: &[Issue],
+) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Issues for {repo}\n\n"));
     out.push_str(&format!("Synced: {}\n\n", today_ymd()));
@@ -414,4 +846,88 @@ fn encode_path_component(input: &str) -> String {
         }
     }
     out
+}
+
+fn split_repo(repo: &str) -> Result<(String, String)> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| eyre::eyre!("repo must be in owner/repo format: {repo}"))?;
+    if owner.is_empty() || name.is_empty() {
+        return Err(eyre::eyre!("repo must be in owner/repo format: {repo}"));
+    }
+    Ok((owner.to_string(), name.to_string()))
+}
+
+fn parse_repo_from_remote(remote: &str) -> Result<String> {
+    let path = if let Some((_, rest)) = remote.split_once("github.com:") {
+        rest
+    } else if let Some((_, rest)) = remote.split_once("github.com/") {
+        rest
+    } else {
+        return Err(eyre::eyre!(
+            "unsupported remote URL format for GitHub: {remote}"
+        ));
+    };
+
+    let cleaned = path.trim().trim_start_matches('/').trim_end_matches(".git");
+    let mut parts = cleaned.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+        return Err(eyre::eyre!(
+            "could not parse owner/repo from remote URL: {remote}"
+        ));
+    }
+    Ok(format!("{owner}/{repo}"))
+}
+
+fn extract_numbers(issue: &Value, field: &str) -> Vec<u64> {
+    issue
+        .get(field)
+        .and_then(|v| v.get("nodes"))
+        .and_then(Value::as_array)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|node| node.get("number").and_then(Value::as_u64))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn format_numbers(numbers: &[u64]) -> String {
+    numbers
+        .iter()
+        .map(|n| format!("#{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn parse_issue_number_from_create_output(output: &str) -> Option<u64> {
+    let token = output.split_whitespace().last()?;
+    token
+        .trim_end_matches('/')
+        .split('/')
+        .next_back()?
+        .parse::<u64>()
+        .ok()
+}
+
+pub fn sync_labels_set(repo: &str) -> Result<BTreeSet<String>> {
+    let labels = sync_labels(repo)?;
+    Ok(labels.into_iter().map(|l| l.name).collect())
+}
+
+pub fn sync_milestones_set(repo: &str) -> Result<BTreeSet<String>> {
+    let milestones = sync_milestones(repo)?;
+    Ok(milestones.into_iter().collect())
 }
