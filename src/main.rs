@@ -20,6 +20,9 @@ enum Command {
     Server,
     /// Assign a task to another agent
     Assign {
+        /// Clear the worker's context before sending the task
+        #[facet(args::named)]
+        clear: bool,
         /// Path to a file containing the task description
         #[facet(args::positional)]
         task_file: PathBuf,
@@ -32,6 +35,7 @@ USAGE:
     bud                        Show this manual
     bud server                 Start the server (usually auto-started)
     bud assign <task-file>     Assign a task to another agent
+    bud assign --clear <file>  Clear worker context first, then assign
 
 WORKFLOW:
     1. Write your task to a file, e.g. /tmp/bud-task-xyz.md
@@ -75,11 +79,11 @@ async fn main() -> Result<()> {
         Some(Command::Server) => {
             server::run_server(socket_path(), pid_path(), response_dir(), log_path()).await
         }
-        Some(Command::Assign { task_file }) => {
+        Some(Command::Assign { clear, task_file }) => {
             let pane = std::env::var("TMUX_PANE")
                 .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
             ensure_server_running().await?;
-            client_assign(pane, task_file).await
+            client_assign(pane, task_file, clear).await
         }
     }
 }
@@ -125,7 +129,7 @@ async fn ensure_server_running() -> Result<()> {
     Err(eyre::eyre!("bud: server failed to start (check {})", log_path().display()))
 }
 
-async fn client_assign(source_pane: String, task_file: PathBuf) -> Result<()> {
+async fn client_assign(source_pane: String, task_file: PathBuf, clear: bool) -> Result<()> {
     use roam_stream::StreamLink;
 
     if !task_file.exists() {
@@ -141,6 +145,7 @@ async fn client_assign(source_pane: String, task_file: PathBuf) -> Result<()> {
         .assign(protocol::AssignRequest {
             source_pane,
             task_file: task_file.to_string_lossy().into_owned(),
+            clear,
         })
         .await
         .map_err(|e| eyre::eyre!("{e:?}"))?;

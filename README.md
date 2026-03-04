@@ -40,6 +40,7 @@ receive results as regular chat messages.
 bud                        Show the manual
 bud server                 Start the server (usually auto-started)
 bud assign <task-file>     Assign a task to another agent
+bud assign --clear <file>  Clear worker context first, then assign
 ```
 
 The server auto-starts on first `bud assign` if it isn't already running.

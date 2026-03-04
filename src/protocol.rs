@@ -6,6 +6,8 @@ pub struct AssignRequest {
     pub source_pane: String,
     /// Path to the file containing the task description
     pub task_file: String,
+    /// Whether to send /clear to the worker before the task
+    pub clear: bool,
 }
 
 #[roam::service]

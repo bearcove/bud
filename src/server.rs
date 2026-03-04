@@ -22,7 +22,7 @@ struct CoopServer {
 
 impl crate::protocol::Coop for CoopServer {
     async fn assign(&self, req: crate::protocol::AssignRequest) -> String {
-        let crate::protocol::AssignRequest { source_pane, task_file } = req;
+        let crate::protocol::AssignRequest { source_pane, task_file, clear } = req;
         let request_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let response_file = self.response_dir.join(format!("{request_id}.md"));
 
@@ -60,6 +60,14 @@ impl crate::protocol::Coop for CoopServer {
                 response_file: response_file.clone(),
             },
         );
+
+        // Optionally clear the worker's context first
+        if clear {
+            if let Err(e) = tmux::send_to_pane(&target.id, "/clear") {
+                error!("failed to send /clear to pane {}: {e}", target.id);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
 
         // Send to worker pane
         if let Err(e) = tmux::send_to_pane(&target.id, &message) {
