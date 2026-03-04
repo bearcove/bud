@@ -125,6 +125,39 @@ pub fn issue_repo_dir(repo: &str) -> PathBuf {
     PathBuf::from("/tmp/bud-issues").join(repo)
 }
 
+pub fn read_issue_file(repo: &str, number: u64) -> Result<String> {
+    let all_dir = issue_repo_dir(repo).join("all");
+    let prefix = format!("{number} - ");
+
+    let entries = std::fs::read_dir(&all_dir)?;
+    for entry in entries {
+        let entry = entry?;
+        if !entry
+            .file_type()
+            .is_ok_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+
+        if !name.ends_with(".md") {
+            continue;
+        }
+
+        return std::fs::read_to_string(entry.path())
+            .map_err(|e| eyre::eyre!("failed to read issue file {}: {e}", entry.path().display()));
+    }
+
+    Err(eyre::eyre!(
+        "Issue #{number} not found. Run 'bud issues' first to sync."
+    ))
+}
+
 pub fn sync_issues(repo: &str) -> Result<Vec<Issue>> {
     let output = Command::new("gh")
         .args([

@@ -70,6 +70,9 @@ enum Command {
         /// Optional short title for the task
         #[facet(args::named)]
         title: Option<String>,
+        /// Attach a GitHub issue context by number
+        #[facet(args::named)]
+        issue: Option<u64>,
     },
     /// Respond to a task (reads from stdin)
     Respond {
@@ -106,6 +109,7 @@ USAGE:
     cat <<'EOF' | bud assign                 Assign a task (clears worker context)
     cat <<'EOF' | bud assign --keep          Assign, keeping worker's context
     cat <<'EOF' | bud assign --title "..."   Assign with a title
+    cat <<'EOF' | bud assign --issue 42      Assign with GitHub issue context
     cat <<'EOF' | bud respond <id>   Respond to a task (reads stdin)
 
 EXAMPLES:
@@ -216,13 +220,13 @@ async fn main() -> Result<()> {
         Some(Command::Update { request_id }) => update_request(&request_id),
         Some(Command::Issues) => sync_issues_to_pane(),
         Some(Command::IssueCreate) => issue_create_from_files(),
-        Some(Command::Assign { keep, title }) => {
+        Some(Command::Assign { keep, title, issue }) => {
             let pane = std::env::var("TMUX_PANE")
                 .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
             let session_name = tmux_session_name_for_pane(&pane)?;
             let content = read_stdin()?;
             ensure_server_running().await?;
-            client_assign(pane, session_name, content, !keep, title).await
+            client_assign(pane, session_name, content, !keep, title, issue).await
         }
         Some(Command::Respond { request_id }) => {
             validate_request_id(&request_id)?;
@@ -301,8 +305,18 @@ async fn client_assign(
     content: String,
     clear: bool,
     title: Option<String>,
+    issue: Option<u64>,
 ) -> Result<()> {
     let binary_hash = hash::binary_hash();
+    let content = if let Some(issue_number) = issue {
+        let repo = github::infer_repo()?;
+        let issue_content = github::read_issue_file(&repo, issue_number)?;
+        format!(
+            "--- GitHub Issue #{issue_number} Context ---\n{issue_content}\n--- End Issue Context ---\n\n{content}\n\nNote: This task is linked to GitHub issue #{issue_number}. Please reference #{issue_number} in any commit messages."
+        )
+    } else {
+        content
+    };
 
     match assign_once(
         &source_pane,
