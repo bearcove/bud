@@ -61,7 +61,9 @@ pub(crate) async fn spy_request(request_id: &str) -> Result<()> {
     let meta = util::read_request_meta(&path)
         .await
         .ok_or_else(|| eyre::eyre!("No task with ID {request_id} found."))?;
-    let pane_content = tmux::capture_pane(&meta.target_pane).await?;
+    let pane_content = tmux::TmuxPane::new(pane::PaneId(meta.target_pane.clone()))
+        .raw_capture()
+        .await?;
     eprintln!("Pane {}:\n{}", meta.target_pane, pane_content);
     Ok(())
 }

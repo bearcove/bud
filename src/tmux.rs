@@ -54,12 +54,17 @@ impl pane::Pane for TmuxPane {
     }
 
     async fn chat_message(&self, message: &str) -> Result<()> {
-        send_to_pane(self.id.0.as_str(), message).await
+        let marker = gen_threemoji();
+        send_pane_with_marker(self.id.0.as_str(), message, &marker).await
     }
 
     async fn snapshot(&self) -> Result<pane::PaneState> {
-        let capture = capture_pane(self.id.0.as_str()).await?;
+        let capture = self.raw_capture().await?;
         Ok(pane::parse_pane_content(&capture))
+    }
+
+    async fn raw_capture(&self) -> Result<String> {
+        capture_pane_contents(self.id.0.as_str()).await
     }
 }
 
@@ -189,8 +194,7 @@ pub async fn list_all_panes() -> Result<Vec<Pane>> {
     Ok(panes)
 }
 
-/// Capture the visible content of a tmux pane.
-pub async fn capture_pane(pane_id: &str) -> Result<String> {
+async fn capture_pane_contents(pane_id: &str) -> Result<String> {
     let output = tokio::process::Command::new("tmux")
         .args(["capture-pane", "-t", pane_id, "-p"])
         .output()
@@ -202,7 +206,7 @@ pub async fn capture_pane(pane_id: &str) -> Result<String> {
 /// indicator from Claude Code / Codex (large pastes).
 async fn wait_for_paste(pane_id: &str, marker: &str) -> Result<()> {
     for _ in 0..100 {
-        let content = capture_pane(pane_id).await?;
+        let content = capture_pane_contents(pane_id).await?;
         if content.contains(marker)
             || content.contains("[Pasted text ")
             || content.contains("[Pasted Content ")
@@ -217,7 +221,7 @@ async fn wait_for_paste(pane_id: &str, marker: &str) -> Result<()> {
 
 async fn wait_for_exact_text(pane_id: &str, text: &str) -> Result<()> {
     for _ in 0..100 {
-        let content = capture_pane(pane_id).await?;
+        let content = capture_pane_contents(pane_id).await?;
         if content.contains(text) {
             return Ok(());
         }
@@ -271,22 +275,10 @@ async fn send_to_pane_exact(pane_id: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Send text to a tmux pane. Uses a unique emoji marker for paste detection,
-/// waits for paste confirmation, then submits with C-m.
-pub async fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
-    let threemoji = gen_threemoji();
-    let tagged = prepare_outgoing_text(text, &threemoji);
-    // marker to wait for before submitting
-    let marker = if is_slash_command(text) {
-        text
-    } else {
-        threemoji.as_str()
-    };
+async fn send_pane_with_marker(pane_id: &str, text: &str, marker: &str) -> Result<()> {
+    let tagged = prepare_outgoing_text(text, marker);
+    let marker = if is_slash_command(text) { text } else { marker };
 
-    send_to_pane_with_marker(pane_id, &tagged, marker).await
-}
-
-async fn send_to_pane_with_marker(pane_id: &str, text: &str, marker: &str) -> Result<()> {
     // Silently exit copy mode if active (no-op if not in copy mode)
     let _ = tokio::process::Command::new("tmux")
         .args(["copy-mode", "-q", "-t", pane_id])
@@ -307,7 +299,7 @@ async fn send_to_pane_with_marker(pane_id: &str, text: &str, marker: &str) -> Re
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let status = tokio::process::Command::new("tmux")
-        .args(["send-keys", "-t", pane_id, "-l", text])
+        .args(["send-keys", "-t", pane_id, "-l", &tagged])
         .status()
         .await?;
     if !status.success() {

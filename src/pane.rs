@@ -37,6 +37,7 @@ pub trait Pane: Send + Sync {
     async fn slash_command(&self, command: &str) -> Result<()>;
     async fn chat_message(&self, message: &str) -> Result<()>;
     async fn snapshot(&self) -> Result<PaneState>;
+    async fn raw_capture(&self) -> Result<String>;
 }
 
 pub struct PaneInfo {

@@ -1009,7 +1009,10 @@ async fn maybe_notify_idle(
 
     let mut sessions_to_notify: Vec<PendingNotify> = Vec::new();
     for candidate in candidates {
-        let pane_capture = match tmux::capture_pane(&candidate.source_pane).await {
+        let pane_capture = match tmux::TmuxPane::new(pane::PaneId(candidate.source_pane.clone()))
+            .raw_capture()
+            .await
+        {
             Ok(content) => content,
             Err(e) => {
                 warn!(
