@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::fs;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -74,7 +75,7 @@ async fn restore_requests_from_disk(
     response_root_dir: &Path,
     requests: &Arc<Mutex<HashMap<String, Request>>>,
 ) {
-    let session_entries = match std::fs::read_dir(request_root_dir) {
+    let mut session_entries = match fs::read_dir(request_root_dir).await {
         Ok(entries) => entries,
         Err(e) => {
             warn!(
@@ -89,23 +90,28 @@ async fn restore_requests_from_disk(
     let mut skipped_with_response = 0usize;
     let mut skipped_invalid = 0usize;
 
-    for session_entry in session_entries.flatten() {
-        if !session_entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+    while let Ok(Some(session_entry)) = session_entries.next_entry().await {
+        let Ok(file_type) = session_entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
             continue;
         }
-
         let session_name = match session_entry.file_name().to_str() {
             Some(name) => name.to_string(),
             None => continue,
         };
         let session_path = session_entry.path();
-        let request_entries = match std::fs::read_dir(&session_path) {
+        let mut request_entries = match fs::read_dir(&session_path).await {
             Ok(entries) => entries,
             Err(_) => continue,
         };
 
-        for request_entry in request_entries.flatten() {
-            if !request_entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+        while let Ok(Some(request_entry)) = request_entries.next_entry().await {
+            let Ok(file_type) = request_entry.file_type().await else {
+                continue;
+            };
+            if !file_type.is_dir() {
                 continue;
             }
 
@@ -116,7 +122,7 @@ async fn restore_requests_from_disk(
             let response_path = response_root_dir
                 .join(&session_name)
                 .join(format!("{request_id}.md"));
-            if response_path.exists() {
+            if fs::metadata(&response_path).await.is_ok() {
                 skipped_with_response += 1;
                 continue;
             }
@@ -157,14 +163,17 @@ async fn restore_requests_from_disk(
     );
 }
 
-fn session_has_request_dirs(request_root_dir: &Path, session_name: &str) -> bool {
+async fn session_has_request_dirs(request_root_dir: &Path, session_name: &str) -> bool {
     let session_path = request_root_dir.join(session_name);
-    let entries = match std::fs::read_dir(&session_path) {
+    let mut entries = match fs::read_dir(&session_path).await {
         Ok(entries) => entries,
         Err(_) => return false,
     };
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if file_type.is_dir() {
             return true;
         }
     }
@@ -260,7 +269,7 @@ impl crate::protocol::Coop for CoopServer {
             &task_content,
         ) {
             self.requests.lock().await.remove(&request_key);
-            let _ = std::fs::remove_dir_all(&request_path);
+            let _ = fs::remove_dir_all(&request_path).await;
             return Err(format!(
                 "failed to persist request {} to {}: {e}",
                 request_id,
@@ -272,7 +281,7 @@ impl crate::protocol::Coop for CoopServer {
             if let Err(e) = tmux::send_to_pane(&target.id, "/clear") {
                 error!("failed to send /clear to pane {}: {e}", target.id);
             }
-            std::thread::sleep(std::time::Duration::from_millis(2000));
+            tokio::time::sleep(Duration::from_millis(2000)).await;
         }
 
         let message = format!(
@@ -289,7 +298,7 @@ impl crate::protocol::Coop for CoopServer {
         if let Err(e) = tmux::send_to_pane(&target.id, &message) {
             error!("failed to send to pane {}: {e}", target.id);
             self.requests.lock().await.remove(&request_key);
-            if let Err(remove_err) = std::fs::remove_dir_all(&request_path)
+            if let Err(remove_err) = fs::remove_dir_all(&request_path).await
                 && remove_err.kind() != std::io::ErrorKind::NotFound
             {
                 error!(
@@ -439,7 +448,7 @@ impl crate::protocol::Coop for CoopServer {
             return Err(format!("no request found for {request_key}"));
         }
 
-        if let Err(e) = std::fs::remove_dir_all(&request_path)
+        if let Err(e) = fs::remove_dir_all(&request_path).await
             && e.kind() != std::io::ErrorKind::NotFound
         {
             return Err(format!(
@@ -456,7 +465,8 @@ impl crate::protocol::Coop for CoopServer {
         let session_empty = {
             let reqs = self.requests.lock().await;
             !reqs.values().any(|req| req.session_name == session_name)
-        } && !session_has_request_dirs(&self.request_root_dir, &session_name);
+        } && !session_has_request_dirs(&self.request_root_dir, &session_name)
+            .await;
 
         if session_empty {
             let (source_pane, title) = if let Some(request) = removed_request.as_ref() {
@@ -511,7 +521,7 @@ impl crate::protocol::Coop for CoopServer {
             return Err(format!("no request found for {request_key}"));
         }
 
-        if let Err(e) = std::fs::remove_dir_all(&request_path)
+        if let Err(e) = fs::remove_dir_all(&request_path).await
             && e.kind() != std::io::ErrorKind::NotFound
         {
             return Err(format!(
@@ -528,7 +538,8 @@ impl crate::protocol::Coop for CoopServer {
         let session_empty = {
             let reqs = self.requests.lock().await;
             !reqs.values().any(|req| req.session_name == session_name)
-        } && !session_has_request_dirs(&self.request_root_dir, &session_name);
+        } && !session_has_request_dirs(&self.request_root_dir, &session_name)
+            .await;
 
         if session_empty {
             let (source_pane, title) = if let Some(request) = removed_request.as_ref() {
@@ -589,7 +600,9 @@ impl crate::protocol::Coop for CoopServer {
         );
 
         if let Err(e) = tmux::send_to_pane(&target_pane, &steer_message) {
-            return Err(format!("failed to deliver steer to pane {target_pane}: {e}"));
+            return Err(format!(
+                "failed to deliver steer to pane {target_pane}: {e}"
+            ));
         }
 
         info!("delivered steer for request {request_id} in session {session_name} via RPC");
@@ -608,10 +621,13 @@ impl crate::protocol::Coop for CoopServer {
         let request_key = request_key(&session_name, &request_id);
 
         // If request no longer exists, the response was already delivered.
+        let request_dir_exists = {
+            let path = self.request_root_dir.join(&session_name).join(&request_id);
+            fs::metadata(&path).await.is_ok()
+        };
         let exists = {
             let reqs = self.requests.lock().await;
-            let path = self.request_root_dir.join(&session_name).join(&request_id);
-            reqs.contains_key(&request_key) || path.exists()
+            reqs.contains_key(&request_key) || request_dir_exists
         };
         if !exists {
             return Ok(crate::protocol::WaitEvent::Response {
@@ -653,7 +669,14 @@ pub async fn run_server(
     request_root_dir: PathBuf,
     log_path: PathBuf,
 ) -> Result<()> {
-    let log_file = std::fs::File::create(&log_path)?;
+    let log_path_for_blocking = log_path.clone();
+    let log_file = tokio::task::spawn_blocking({
+        let log_path_for_blocking = log_path_for_blocking.clone();
+        move || std::fs::File::create(log_path_for_blocking)
+    })
+    .await
+    .map_err(|e| eyre::eyre!("failed to create log file {}: {e}", log_path.display()))??;
+
     tracing_subscriber::fmt()
         .with_writer(log_file)
         .with_env_filter(
@@ -661,14 +684,14 @@ pub async fn run_server(
         )
         .init();
 
-    std::fs::create_dir_all(&response_root_dir)?;
-    std::fs::create_dir_all(&request_root_dir)?;
+    fs::create_dir_all(&response_root_dir).await?;
+    fs::create_dir_all(&request_root_dir).await?;
 
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
+    if fs::metadata(&socket_path).await.is_ok() {
+        fs::remove_file(&socket_path).await?;
     }
 
-    std::fs::write(&pid_path, std::process::id().to_string())?;
+    fs::write(&pid_path, std::process::id().to_string()).await?;
 
     info!("mate server starting on {}", socket_path.display());
     info!("watching for responses in {}", response_root_dir.display());
@@ -963,7 +986,7 @@ async fn run_staleness_checks(
 ) {
     let mut active_request_keys: HashSet<String> = HashSet::new();
 
-    let session_entries = match std::fs::read_dir(request_root_dir) {
+    let mut session_entries = match fs::read_dir(request_root_dir).await {
         Ok(entries) => entries,
         Err(_) => {
             pane_states.clear();
@@ -971,27 +994,31 @@ async fn run_staleness_checks(
         }
     };
 
-    for session_entry in session_entries.flatten() {
+    while let Ok(Some(session_entry)) = session_entries.next_entry().await {
         let session_path = session_entry.path();
         let session_name = match session_entry.file_name().to_str() {
             Some(name) => name.to_string(),
             None => continue,
         };
-        match session_entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => {}
-            _ => continue,
+        let Ok(file_type) = session_entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
         }
 
-        let request_entries = match std::fs::read_dir(&session_path) {
+        let mut request_entries = match fs::read_dir(&session_path).await {
             Ok(entries) => entries,
             Err(_) => continue,
         };
 
-        for request_entry in request_entries.flatten() {
+        while let Ok(Some(request_entry)) = request_entries.next_entry().await {
             let request_path = request_entry.path();
-            match request_entry.file_type() {
-                Ok(file_type) if file_type.is_dir() => {}
-                _ => continue,
+            let Ok(file_type) = request_entry.file_type().await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
             }
 
             let request_id = match request_entry.file_name().to_str() {
@@ -1004,7 +1031,7 @@ async fn run_staleness_checks(
             let response_path = response_root_dir
                 .join(&session_name)
                 .join(format!("{request_id}.md"));
-            if response_path.exists() {
+            if fs::metadata(&response_path).await.is_ok() {
                 continue;
             }
 
@@ -1157,32 +1184,36 @@ async fn process_response_files(
     idle_states: &Arc<Mutex<HashMap<String, IdleState>>>,
     pane_states: &mut HashMap<String, PaneState>,
 ) {
-    let session_entries = match std::fs::read_dir(response_root_dir) {
+    let mut session_entries = match fs::read_dir(response_root_dir).await {
         Ok(entries) => entries,
         Err(_) => return,
     };
 
-    for session_entry in session_entries.flatten() {
+    while let Ok(Some(session_entry)) = session_entries.next_entry().await {
         let session_path = session_entry.path();
         let session_name = match session_entry.file_name().to_str() {
             Some(name) => name.to_string(),
             None => continue,
         };
-        match session_entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => {}
-            _ => continue,
+        let Ok(file_type) = session_entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
         }
 
-        let response_entries = match std::fs::read_dir(&session_path) {
+        let mut response_entries = match fs::read_dir(&session_path).await {
             Ok(entries) => entries,
             Err(_) => continue,
         };
 
-        for response_entry in response_entries.flatten() {
+        while let Ok(Some(response_entry)) = response_entries.next_entry().await {
             let response_path = response_entry.path();
-            match response_entry.file_type() {
-                Ok(file_type) if file_type.is_file() => {}
-                _ => continue,
+            let Ok(file_type) = response_entry.file_type().await else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
             }
             let Some(filename) = response_path.file_name().and_then(|s| s.to_str()) else {
                 continue;
@@ -1199,7 +1230,7 @@ async fn process_response_files(
                 None => continue,
             };
             let key = request_key(&session_name, &request_id);
-            let body = match std::fs::read_to_string(&response_path) {
+            let body = match fs::read_to_string(&response_path).await {
                 Ok(content) => content,
                 Err(_) => "(could not read response file)".to_string(),
             };
@@ -1207,8 +1238,8 @@ async fn process_response_files(
                 // Legacy file-based accept marker; accept is RPC-only now.
                 // Dropping this marker avoids double-processing races.
                 let waiter_marker = session_path.join(format!("{request_id}.waiter"));
-                let _ = std::fs::remove_file(&waiter_marker);
-                if let Err(e) = std::fs::remove_file(&response_path)
+                let _ = fs::remove_file(&waiter_marker).await;
+                if let Err(e) = fs::remove_file(&response_path).await
                     && e.kind() != std::io::ErrorKind::NotFound
                 {
                     error!(
@@ -1234,7 +1265,7 @@ async fn process_response_files(
                 match crate::util::read_request_meta(&request_path) {
                     Some(meta) => (meta.source_pane, meta.target_pane, meta.title),
                     None => {
-                        if let Err(e) = std::fs::create_dir_all(orphaned_dir()) {
+                        if let Err(e) = fs::create_dir_all(orphaned_dir()).await {
                             error!(
                                 "failed to create orphaned response directory {}: {e}",
                                 orphaned_dir().display()
@@ -1243,11 +1274,21 @@ async fn process_response_files(
                         }
                         let orphaned_path =
                             orphaned_dir().join(format!("{session_name}-{request_id}.md"));
-                        let move_result =
-                            std::fs::rename(&response_path, &orphaned_path).or_else(|_| {
-                                std::fs::copy(&response_path, &orphaned_path)?;
-                                std::fs::remove_file(&response_path)
-                            });
+                        let move_result = match fs::rename(&response_path, &orphaned_path).await {
+                            Ok(()) => Ok(()),
+                            Err(_) => {
+                                if let Err(copy_err) =
+                                    fs::copy(&response_path, &orphaned_path).await
+                                {
+                                    Err(copy_err)
+                                } else {
+                                    match fs::remove_file(&response_path).await {
+                                        Ok(()) => Ok(()),
+                                        Err(remove_err) => Err(remove_err),
+                                    }
+                                }
+                            }
+                        };
                         match move_result {
                             Ok(()) => {
                                 warn!(
@@ -1286,9 +1327,10 @@ async fn process_response_files(
                 "{intro}\n{body}\n\nRemember: you're the captain. If there's follow-up work, assign it to your mate — don't do it yourself. Stay focused on the big picture!{commit_reminder}{git_section}"
             );
             let waiter_marker = session_path.join(format!("{request_id}.waiter"));
-            if waiter_marker.exists() {
+            let waiter_exists = fs::metadata(&waiter_marker).await.is_ok();
+            if waiter_exists {
                 let final_path = session_path.join(format!("{request_id}.final.md"));
-                if let Err(e) = std::fs::write(&final_path, &message) {
+                if let Err(e) = fs::write(&final_path, &message).await {
                     error!(
                         "failed to write final wait response for request {} in session {} to {}: {e}",
                         request_id,
@@ -1304,9 +1346,9 @@ async fn process_response_files(
                 );
                 continue;
             }
-            let _ = std::fs::remove_file(&waiter_marker);
+            let _ = fs::remove_file(&waiter_marker).await;
 
-            if let Err(e) = std::fs::remove_dir_all(&request_path)
+            if let Err(e) = fs::remove_dir_all(&request_path).await
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 error!(
@@ -1315,7 +1357,7 @@ async fn process_response_files(
                 );
             }
             pane_states.remove(&key);
-            if let Err(e) = std::fs::remove_file(&response_path)
+            if let Err(e) = fs::remove_file(&response_path).await
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 error!(
