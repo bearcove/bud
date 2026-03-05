@@ -22,7 +22,7 @@ pub struct PaneState {
     pub agent_type: Option<AgentType>,
     pub state: AgentState,
     pub model: Option<String>,
-    pub context_remaining: Option<String>,
+    pub context_remaining_percent: Option<u8>,
     pub activity: Option<String>,
 }
 
@@ -61,7 +61,7 @@ impl Default for PaneState {
             agent_type: None,
             state: AgentState::Unknown,
             model: None,
-            context_remaining: None,
+            context_remaining_percent: None,
             activity: None,
         }
     }
@@ -100,10 +100,10 @@ fn parse_codex(lines: &[&str]) -> Option<PaneState> {
         .iter()
         .rev()
         .find_map(|line| parse_codex_status_line(line));
-    let context_remaining = lines
+    let context_remaining_percent = lines
         .iter()
         .rev()
-        .find_map(|line| extract_codex_context(line));
+        .find_map(|line| parse_codex_context_percent(line));
     let has_codex_ui_marker = lines.iter().any(|line| {
         line.contains("OpenAI Codex")
             || line.contains("Run /review")
@@ -126,7 +126,7 @@ fn parse_codex(lines: &[&str]) -> Option<PaneState> {
             agent_type: Some(AgentType::Codex),
             state: AgentState::Working,
             model,
-            context_remaining,
+            context_remaining_percent,
             activity,
         });
     }
@@ -139,7 +139,7 @@ fn parse_codex(lines: &[&str]) -> Option<PaneState> {
         agent_type: Some(AgentType::Codex),
         state: AgentState::Idle,
         model,
-        context_remaining,
+        context_remaining_percent,
         activity: None,
     })
 }
@@ -162,9 +162,9 @@ fn parse_claude(lines: &[&str]) -> Option<PaneState> {
         line.contains("⏺ Done.")
             || (line.contains("Worked for") && (line.contains('✻') || line.contains('✽')))
     });
-    let context_remaining = extract_tokens_phrase(lines);
+    let context_remaining_percent = parse_claude_context_percent(lines);
     let has_claude_identity =
-        has_claude_ui_marker || has_claude_completion_marker || context_remaining.is_some();
+        has_claude_ui_marker || has_claude_completion_marker || context_remaining_percent.is_some();
 
     if let Some(activity_line) = spinner_line {
         if !has_prompt || !has_claude_identity {
@@ -174,7 +174,7 @@ fn parse_claude(lines: &[&str]) -> Option<PaneState> {
             agent_type: Some(AgentType::Claude),
             state: AgentState::Working,
             model: None,
-            context_remaining,
+            context_remaining_percent,
             activity: Some(activity_line),
         });
     }
@@ -187,7 +187,7 @@ fn parse_claude(lines: &[&str]) -> Option<PaneState> {
         agent_type: Some(AgentType::Claude),
         state: AgentState::Idle,
         model: None,
-        context_remaining,
+        context_remaining_percent,
         activity: None,
     })
 }
@@ -198,11 +198,7 @@ fn parse_codex_status_line(line: &str) -> Option<String> {
         return None;
     }
     let model_start = trimmed.find("gpt-")?;
-    let context = extract_codex_context(trimmed);
-    let context_start = context
-        .as_deref()
-        .and_then(|value| trimmed.find(value))
-        .unwrap_or(trimmed.len());
+    let context_start = parse_codex_context_end(trimmed).unwrap_or(trimmed.len());
     let mut model = trimmed[model_start..context_start].trim().to_string();
     if model.ends_with('·') {
         model.pop();
@@ -215,14 +211,14 @@ fn parse_codex_status_line(line: &str) -> Option<String> {
     Some(model)
 }
 
-fn extract_tokens_phrase(lines: &[&str]) -> Option<String> {
+fn parse_claude_context_percent(lines: &[&str]) -> Option<u8> {
     lines
         .iter()
         .rev()
-        .find_map(|line| extract_tokens_from_line(line))
+        .find_map(|line| parse_claude_context_percent_from_line(line))
 }
 
-fn extract_tokens_from_line(line: &str) -> Option<String> {
+fn parse_claude_context_percent_from_line(line: &str) -> Option<u8> {
     let bytes = line.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -242,41 +238,39 @@ fn extract_tokens_from_line(line: &str) -> Option<String> {
         }
 
         if line[i..].starts_with("tokens") {
-            return Some(format!("{digits} tokens"));
+            let tokens = digits.parse::<u64>().ok()?;
+            let percent_left = 100u64.saturating_sub(tokens.saturating_mul(100) / 200_000);
+            return Some(percent_left.min(100) as u8);
         }
     }
 
     None
 }
 
-fn extract_codex_context(line: &str) -> Option<String> {
-    if let Some(left_idx) = line.find("% left") {
-        let prefix = &line[..left_idx];
-        let start = prefix
-            .char_indices()
-            .rev()
-            .find(|(_, ch)| !ch.is_ascii_digit())
-            .map(|(idx, ch)| idx + ch.len_utf8())
-            .unwrap_or(0);
-        let percent = prefix[start..].trim();
-        if !percent.is_empty() {
-            return Some(format!("{percent}% left"));
-        }
+fn parse_codex_context_end(line: &str) -> Option<usize> {
+    line.find("% context left").or_else(|| line.find("% left"))
+}
+
+fn parse_codex_context_percent(line: &str) -> Option<u8> {
+    parse_codex_context_percent_from_marker(line, "% context left")
+        .or_else(|| parse_codex_context_percent_from_marker(line, "% left"))
+}
+
+fn parse_codex_context_percent_from_marker(line: &str, marker: &str) -> Option<u8> {
+    let left_idx = line.find(marker)?;
+    let prefix = &line[..left_idx];
+    let start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .unwrap_or(0);
+    let percent = prefix[start..].trim();
+    if percent.is_empty() {
+        return None;
     }
-    if let Some(left_idx) = line.find("% context left") {
-        let prefix = &line[..left_idx];
-        let start = prefix
-            .char_indices()
-            .rev()
-            .find(|(_, ch)| !ch.is_ascii_digit())
-            .map(|(idx, ch)| idx + ch.len_utf8())
-            .unwrap_or(0);
-        let percent = prefix[start..].trim();
-        if !percent.is_empty() {
-            return Some(format!("{percent}% context left"));
-        }
-    }
-    None
+    let percent_left = percent.parse::<u8>().ok()?;
+    Some(percent_left.min(100))
 }
 
 fn parse_claude_spinner_activity(line: &str) -> Option<String> {

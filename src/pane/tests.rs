@@ -14,6 +14,7 @@ fn detects_claude_working_snapshot_from_recording() {
     let parsed = parse_pane_content(text);
     assert_eq!(parsed.agent_type, Some(AgentType::Claude));
     assert_eq!(parsed.state, AgentState::Working);
+    assert_eq!(parsed.context_remaining_percent, Some(100));
 }
 
 #[test]
@@ -42,6 +43,7 @@ fn detects_codex_working_snapshot_from_recording() {
     let parsed = parse_pane_content(text);
     assert_eq!(parsed.agent_type, Some(AgentType::Codex));
     assert_eq!(parsed.state, AgentState::Working);
+    assert_eq!(parsed.context_remaining_percent, Some(98));
 }
 
 #[test]

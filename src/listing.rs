@@ -107,7 +107,7 @@ pub(crate) struct AgentListRow {
     pub(crate) role: String,
     pub(crate) state: String,
     pub(crate) idle: String,
-    pub(crate) context: String,
+    pub(crate) context: Option<u8>,
     pub(crate) activity: String,
     pub(crate) tasks: Vec<String>,
 }
@@ -119,30 +119,7 @@ fn format_idle_for_block(idle_seconds: Option<u64>) -> String {
     }
 }
 
-fn parse_context_percent_left(context: &str) -> Option<u64> {
-    let trimmed = context.trim();
-    if let Some(left_idx) = trimmed.find("% left") {
-        let prefix = &trimmed[..left_idx];
-        let digits_start = prefix
-            .char_indices()
-            .rev()
-            .find(|(_, ch)| !ch.is_ascii_digit())
-            .map(|(idx, ch)| idx + ch.len_utf8())
-            .unwrap_or(0);
-        if let Ok(percent) = prefix[digits_start..].trim().parse::<u64>() {
-            return Some(percent.min(100));
-        }
-    }
-    if let Some(tokens_str) = trimmed.strip_suffix(" tokens")
-        && let Ok(tokens) = tokens_str.trim().parse::<u64>()
-    {
-        let percent_used = tokens.saturating_mul(100) / 200_000;
-        return Some(100u64.saturating_sub(percent_used));
-    }
-    None
-}
-
-fn context_progress_bar(percent_left: u64) -> String {
+fn context_progress_bar(percent_left: u8) -> String {
     let clamped = percent_left.min(100);
     let filled = ((clamped + 5) / 10) as usize;
     let mut bar = String::with_capacity(12);
@@ -158,26 +135,14 @@ fn context_progress_bar(percent_left: u64) -> String {
     bar
 }
 
-pub(crate) fn format_context_line(context: &str) -> String {
-    let trimmed = context.trim();
-    if trimmed == "-" {
+pub(crate) fn format_context_line(context: Option<u8>) -> String {
+    let Some(percent_left) = context else {
         return "Context: -".to_string();
-    }
-    if let Some(percent_left) = parse_context_percent_left(trimmed) {
-        if let Some(tokens_str) = trimmed.strip_suffix(" tokens")
-            && let Ok(tokens) = tokens_str.trim().parse::<u64>()
-        {
-            return format!(
-                "Context: {tokens} tokens -> {percent_left}% left {}",
-                context_progress_bar(percent_left)
-            );
-        }
-        return format!(
-            "Context: {percent_left}% left {}",
-            context_progress_bar(percent_left)
-        );
-    }
-    format!("Context: {trimmed}")
+    };
+    format!(
+        "Context: {percent_left}% left {}",
+        context_progress_bar(percent_left)
+    )
 }
 
 pub(crate) fn render_request_blocks(rows: &[RequestListRow]) -> String {
@@ -228,7 +193,7 @@ pub(crate) fn render_agent_blocks(rows: &[AgentListRow]) -> String {
         if !row.tasks.is_empty() {
             lines.push(format!("Task: {}", row.tasks.join(", ")));
         }
-        lines.push(format_context_line(&row.context));
+        lines.push(format_context_line(row.context));
         let base_status = format_status(&row.state, &row.activity);
         if row.state.eq_ignore_ascii_case("idle") && row.idle != "-" {
             lines.push(format!("Status: {base_status} ({}s)", row.idle));
@@ -459,7 +424,7 @@ pub(crate) async fn list_requests() -> Result<()> {
                 let idle_seconds = idle_tracker
                     .update(&p.session_name, &p.id, &parsed.state)
                     .await;
-                let context = parsed.context_remaining.unwrap_or_else(|| "-".to_string());
+                let context = parsed.context_remaining_percent;
                 let activity = parsed
                     .activity
                     .map(|value| value.replace('\n', " "))

@@ -364,8 +364,10 @@ pub(crate) async fn wait_for_response(request_id: &str, timeout_secs: u64) -> Re
                                     crate::pane::AgentState::Idle => "Idle",
                                     crate::pane::AgentState::Unknown => "Unknown",
                                 };
-                                let context =
-                                    parsed.context_remaining.unwrap_or_else(|| "-".to_string());
+                                let context = parsed
+                                    .context_remaining_percent
+                                    .map(|percent| format!("{percent}% left"))
+                                    .unwrap_or_else(|| "-".to_string());
                                 let mut suffix = format!(" · {agent} · {state} · {context}");
                                 if let Some(activity) = parsed.activity {
                                     let activity = activity.replace('\n', " ");

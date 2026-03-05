@@ -73,7 +73,7 @@ fn list_headers_include_idle_seconds_column() {
         role: "Mate".to_string(),
         state: "Idle".to_string(),
         idle: "42".to_string(),
-        context: "98% left".to_string(),
+        context: Some(98),
         activity: "Running checks".to_string(),
         tasks: vec!["deadbeef (Example)".to_string()],
     }]);
@@ -114,7 +114,7 @@ fn agent_blocks_follow_grouped_shape() {
         role: "Mate".to_string(),
         state: "Working".to_string(),
         idle: "0".to_string(),
-        context: "35% left".to_string(),
+        context: Some(35),
         activity: "17s - esc to interrupt".to_string(),
         tasks: vec!["805fbe4a (static-edit-verifier-167)".to_string()],
     }]);
@@ -162,7 +162,7 @@ fn agent_blocks_omit_task_line_when_none_assigned() {
         role: "Unknown".to_string(),
         state: "Idle".to_string(),
         idle: "0".to_string(),
-        context: "-".to_string(),
+        context: None,
         activity: "-".to_string(),
         tasks: Vec::new(),
     }]);
@@ -183,8 +183,8 @@ fn agent_task_summary_includes_title_when_present() {
 #[test]
 fn claude_tokens_context_normalizes_to_percent_line() {
     assert_eq!(
-        format_context_line("73740 tokens"),
-        "Context: 73740 tokens -> 64% left [######----]"
+        format_context_line(Some(64)),
+        "Context: 64% left [######----]"
     );
 }
 
@@ -208,7 +208,7 @@ fn session_grouping_contains_session_heading_and_both_sections() {
             role: "Mate".to_string(),
             state: "Working".to_string(),
             idle: "0".to_string(),
-            context: "35% left".to_string(),
+            context: Some(35),
             activity: "17s - esc to interrupt".to_string(),
             tasks: vec!["805fbe4a (static-edit-verifier-167)".to_string()],
         }],
@@ -326,7 +326,7 @@ fn idle_status_merges_idle_seconds_on_status_line() {
         role: "Captain".to_string(),
         state: "Idle".to_string(),
         idle: "24".to_string(),
-        context: "67% left".to_string(),
+        context: Some(67),
         activity: "-".to_string(),
         tasks: vec!["deadbeef".to_string()],
     }]);
