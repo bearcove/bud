@@ -156,6 +156,10 @@ fn request_dir(session_name: &str) -> PathBuf {
     request_root_dir().join(session_name)
 }
 
+fn idle_tracking_root_dir() -> PathBuf {
+    PathBuf::from("/tmp/bud-idle")
+}
+
 fn orphaned_dir() -> PathBuf {
     PathBuf::from("/tmp/bud-orphaned")
 }
@@ -441,7 +445,7 @@ fn steer_request(request_id: &str) -> Result<()> {
     let meta = util::read_request_meta(&path)
         .ok_or_else(|| eyre::eyre!("No task with ID {request_id} found."))?;
     let message = read_stdin()?;
-    let steer = format!("📌 Update from the captain on task {request_id}:\n\n{message}");
+    let steer = format_captain_update_for_buddy(request_id, &message);
     tmux::send_to_pane(&meta.target_pane, &steer)?;
     eprintln!(
         "Sent steer update for task {request_id} to pane {}.",
@@ -501,6 +505,394 @@ fn update_request(request_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn format_captain_update_for_buddy(request_id: &str, message: &str) -> String {
+    format!(
+        "📌 Update from the captain on task {request_id}:\n\n\
+         {message}\n\n\
+         If you hit a decision point, want to share progress, or need clarification, send an update:\n\n\
+         cat <<'BUDEOF' | bud update {request_id}\n\
+         <your progress update here>\n\
+         BUDEOF\n\n\
+         IMPORTANT: When you're done, you MUST send your response by executing \
+         this shell command (use your Bash/shell tool — do NOT just print it as text):\n\n\
+         cat <<'BUDEOF' | bud respond {request_id}\n\
+         <put your full response here>\n\
+         BUDEOF"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AgentListRow, DraftCleanupOutcome, DraftMissingStage, IdleTracker, RequestListRow,
+        classify_agent_role, cleanup_created_draft, format_agent_task_summary,
+        format_captain_update_for_buddy, format_context_line, format_idle_seconds,
+        format_missing_draft_message, format_status, render_agent_blocks, render_request_blocks,
+        render_session_groups,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn captain_update_includes_buddy_response_instructions() {
+        let request_id = "deadbeef";
+        let update = format_captain_update_for_buddy(request_id, "Please focus on parser tests.");
+
+        assert!(update.contains("📌 Update from the captain on task deadbeef:"));
+        assert!(update.contains("cat <<'BUDEOF' | bud update deadbeef"));
+        assert!(update.contains("cat <<'BUDEOF' | bud respond deadbeef"));
+        assert!(update.contains("<your progress update here>"));
+        assert!(update.contains("<put your full response here>"));
+    }
+
+    #[test]
+    fn missing_draft_message_mentions_concurrency_only_with_evidence() {
+        let path = Path::new("/tmp/bud-issues/example/new/draft.md");
+
+        let neutral = format_missing_draft_message(path, DraftMissingStage::AfterCreate, false);
+        assert!(neutral.contains("already removed after create"));
+        assert!(!neutral.to_ascii_lowercase().contains("concurrent"));
+
+        let concurrent = format_missing_draft_message(path, DraftMissingStage::AfterCreate, true);
+        assert!(concurrent.contains("Concurrent `bud issues` run detected."));
+    }
+
+    #[test]
+    fn cleanup_created_draft_handles_removed_and_missing_states() {
+        let root = std::env::temp_dir().join(format!("bud-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp directory");
+        let existing = root.join("existing.md");
+        std::fs::write(&existing, "draft").expect("write draft file");
+
+        let removed = cleanup_created_draft(&existing).expect("remove existing draft");
+        assert_eq!(removed, DraftCleanupOutcome::Removed);
+        assert!(!existing.exists(), "existing draft should be removed");
+
+        let missing = root.join("missing.md");
+        let missing_outcome = cleanup_created_draft(&missing).expect("remove missing draft");
+        assert_eq!(missing_outcome, DraftCleanupOutcome::Missing);
+
+        std::fs::remove_dir_all(&root).expect("remove temp directory");
+    }
+
+    #[test]
+    fn idle_tracker_updates_and_resets_on_activity() {
+        let root = std::env::temp_dir().join(format!("bud-idle-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create idle test directory");
+
+        let mut tracker = IdleTracker::new(100, root.clone());
+        assert_eq!(
+            tracker.update("sess", "%42", &crate::pane::AgentState::Idle),
+            Some(0)
+        );
+
+        let mut tracker = IdleTracker::new(108, root.clone());
+        assert_eq!(
+            tracker.update("sess", "%42", &crate::pane::AgentState::Idle),
+            Some(8)
+        );
+
+        let mut tracker = IdleTracker::new(120, root.clone());
+        assert_eq!(
+            tracker.update("sess", "%42", &crate::pane::AgentState::Working),
+            None
+        );
+
+        let idle_file = PathBuf::from(&root).join("sess").join("%42.idle");
+        assert!(
+            !idle_file.exists(),
+            "idle tracking file should be removed after activity resumes"
+        );
+
+        let mut tracker = IdleTracker::new(130, root.clone());
+        assert_eq!(
+            tracker.update("sess", "%42", &crate::pane::AgentState::Idle),
+            Some(0)
+        );
+
+        std::fs::remove_dir_all(&root).expect("remove idle test directory");
+    }
+
+    #[test]
+    fn list_headers_include_idle_seconds_column() {
+        let request_blocks = render_request_blocks(&[RequestListRow {
+            session: "sess".to_string(),
+            id: "deadbeef".to_string(),
+            source: "%1".to_string(),
+            target: "%2".to_string(),
+            title: Some("example title".to_string()),
+            age: "12s".to_string(),
+            idle_seconds: Some(42),
+            response: "no".to_string(),
+        }]);
+        let agent_blocks = render_agent_blocks(&[AgentListRow {
+            session: "sess".to_string(),
+            pane_id: "%2".to_string(),
+            agent: "Codex".to_string(),
+            role: "Buddy".to_string(),
+            state: "Idle".to_string(),
+            idle: "42".to_string(),
+            context: "98% left".to_string(),
+            activity: "Running checks".to_string(),
+            tasks: vec!["deadbeef (Example)".to_string()],
+        }]);
+
+        assert!(request_blocks.contains("Age/Idle/Response:"));
+        assert!(request_blocks.contains("42s"));
+        assert!(agent_blocks.contains("Task: deadbeef (Example)"));
+        assert!(agent_blocks.contains("Context: 98% left"));
+        assert!(agent_blocks.contains("Status:"));
+        assert!(!agent_blocks.contains("\nIdle:"));
+        assert_eq!(format_idle_seconds(Some(42)), "42");
+        assert_eq!(format_idle_seconds(None), "-");
+    }
+
+    #[test]
+    fn request_blocks_follow_grouped_shape() {
+        let blocks = render_request_blocks(&[RequestListRow {
+            session: "session-alpha".to_string(),
+            id: "deadbeef".to_string(),
+            source: "%1".to_string(),
+            target: "%2".to_string(),
+            title: Some("Long title for readability".to_string()),
+            age: "12s".to_string(),
+            idle_seconds: Some(7),
+            response: "no".to_string(),
+        }]);
+        assert!(blocks.contains("Task: deadbeef @ session-alpha (%1 -> %2)"));
+        assert!(blocks.contains("Title: Long title for readability"));
+        assert!(blocks.contains("Age/Idle/Response: 12s / 7s / no"));
+    }
+
+    #[test]
+    fn agent_blocks_follow_grouped_shape() {
+        let blocks = render_agent_blocks(&[AgentListRow {
+            session: "3".to_string(),
+            pane_id: "%24".to_string(),
+            agent: "Claude".to_string(),
+            role: "Buddy".to_string(),
+            state: "Working".to_string(),
+            idle: "0".to_string(),
+            context: "35% left".to_string(),
+            activity: "17s - esc to interrupt".to_string(),
+            tasks: vec!["805fbe4a (static-edit-verifier-167)".to_string()],
+        }]);
+        assert!(blocks.contains("Agent: Claude @ 3/%24 | Role: Buddy"));
+        assert!(blocks.contains("Task: 805fbe4a (static-edit-verifier-167)"));
+        assert!(blocks.contains("Context: 35% left [####------]"));
+        assert!(blocks.contains("Status: Working (17s - esc to interrupt)"));
+        assert!(!blocks.contains("Working (Working"));
+        assert!(!blocks.contains("\nIdle:"));
+    }
+
+    #[test]
+    fn block_renderer_separates_multiple_entries_with_blank_line() {
+        let requests = render_request_blocks(&[
+            RequestListRow {
+                session: "s".to_string(),
+                id: "aaaaaaaa".to_string(),
+                source: "%1".to_string(),
+                target: "%2".to_string(),
+                title: Some("one".to_string()),
+                age: "1m".to_string(),
+                idle_seconds: Some(0),
+                response: "no".to_string(),
+            },
+            RequestListRow {
+                session: "s".to_string(),
+                id: "bbbbbbbb".to_string(),
+                source: "%1".to_string(),
+                target: "%3".to_string(),
+                title: Some("two".to_string()),
+                age: "2m".to_string(),
+                idle_seconds: Some(5),
+                response: "yes".to_string(),
+            },
+        ]);
+        assert!(requests.contains("no\n\nTask: bbbbbbbb"));
+    }
+
+    #[test]
+    fn agent_blocks_omit_task_line_when_none_assigned() {
+        let blocks = render_agent_blocks(&[AgentListRow {
+            session: "3".to_string(),
+            pane_id: "%6".to_string(),
+            agent: "Codex".to_string(),
+            role: "Unknown".to_string(),
+            state: "Idle".to_string(),
+            idle: "0".to_string(),
+            context: "-".to_string(),
+            activity: "-".to_string(),
+            tasks: Vec::new(),
+        }]);
+        assert!(!blocks.contains("Task: -"));
+        assert!(!blocks.contains("\nTask:"));
+        assert!(blocks.contains("Status: Idle (0s)"));
+    }
+
+    #[test]
+    fn agent_task_summary_includes_title_when_present() {
+        assert_eq!(
+            format_agent_task_summary("deadbeef", Some("My title")),
+            "deadbeef (My title)"
+        );
+        assert_eq!(format_agent_task_summary("deadbeef", None), "deadbeef");
+    }
+
+    #[test]
+    fn claude_tokens_context_normalizes_to_percent_line() {
+        assert_eq!(
+            format_context_line("73740 tokens"),
+            "Context: 73740 tokens -> 36% left [####------]"
+        );
+    }
+
+    #[test]
+    fn session_grouping_contains_session_heading_and_both_sections() {
+        let output = render_session_groups(
+            &[RequestListRow {
+                session: "3".to_string(),
+                id: "805fbe4a".to_string(),
+                source: "%6".to_string(),
+                target: "%24".to_string(),
+                title: Some("static-edit-verifier-167".to_string()),
+                age: "35m".to_string(),
+                idle_seconds: Some(0),
+                response: "no".to_string(),
+            }],
+            &[AgentListRow {
+                session: "3".to_string(),
+                pane_id: "%24".to_string(),
+                agent: "Codex".to_string(),
+                role: "Buddy".to_string(),
+                state: "Working".to_string(),
+                idle: "0".to_string(),
+                context: "35% left".to_string(),
+                activity: "17s - esc to interrupt".to_string(),
+                tasks: vec!["805fbe4a (static-edit-verifier-167)".to_string()],
+            }],
+        );
+        assert!(output.contains("Session 3"));
+        assert!(output.contains("Tasks:"));
+        assert!(output.contains("Agents:"));
+        assert!(output.contains("Agent: Codex @ 3/%24"));
+        assert!(output.contains("Task: 805fbe4a (static-edit-verifier-167)"));
+    }
+
+    #[test]
+    fn session_grouping_omits_empty_section_placeholders() {
+        let output = render_session_groups(
+            &[RequestListRow {
+                session: "3".to_string(),
+                id: "deadbeef".to_string(),
+                source: "%6".to_string(),
+                target: "%24".to_string(),
+                title: None,
+                age: "1m".to_string(),
+                idle_seconds: Some(0),
+                response: "no".to_string(),
+            }],
+            &[],
+        );
+        assert!(output.contains("Session 3"));
+        assert!(output.contains("Tasks:"));
+        assert!(!output.contains("Agents:"));
+        assert!(!output.contains("Agent: -"));
+        assert!(!output.contains("Task: -"));
+    }
+
+    #[test]
+    fn classify_agent_role_captain_buddy_mixed_unknown() {
+        let requests = vec![
+            RequestListRow {
+                session: "3".to_string(),
+                id: "a".to_string(),
+                source: "%6".to_string(),
+                target: "%24".to_string(),
+                title: None,
+                age: "1m".to_string(),
+                idle_seconds: Some(0),
+                response: "no".to_string(),
+            },
+            RequestListRow {
+                session: "3".to_string(),
+                id: "b".to_string(),
+                source: "%24".to_string(),
+                target: "%6".to_string(),
+                title: None,
+                age: "1m".to_string(),
+                idle_seconds: Some(0),
+                response: "no".to_string(),
+            },
+        ];
+        assert_eq!(classify_agent_role("3", "%7", &requests), "Unknown");
+        assert_eq!(classify_agent_role("3", "%6", &requests), "Mixed");
+        assert_eq!(classify_agent_role("3", "%24", &requests), "Mixed");
+        assert_eq!(
+            classify_agent_role(
+                "3",
+                "%1",
+                &[RequestListRow {
+                    session: "3".to_string(),
+                    id: "x".to_string(),
+                    source: "%1".to_string(),
+                    target: "%2".to_string(),
+                    title: None,
+                    age: "1m".to_string(),
+                    idle_seconds: Some(0),
+                    response: "no".to_string(),
+                }]
+            ),
+            "Captain"
+        );
+        assert_eq!(
+            classify_agent_role(
+                "3",
+                "%2",
+                &[RequestListRow {
+                    session: "3".to_string(),
+                    id: "x".to_string(),
+                    source: "%1".to_string(),
+                    target: "%2".to_string(),
+                    title: None,
+                    age: "1m".to_string(),
+                    idle_seconds: Some(0),
+                    response: "no".to_string(),
+                }]
+            ),
+            "Buddy"
+        );
+    }
+
+    #[test]
+    fn status_format_dedups_repeated_state_prefix() {
+        assert_eq!(
+            format_status("Working", "Working (17s - esc to interrupt)"),
+            "Working (17s - esc to interrupt)"
+        );
+        assert_eq!(
+            format_status("Working", "17s - esc to interrupt"),
+            "Working (17s - esc to interrupt)"
+        );
+    }
+
+    #[test]
+    fn idle_status_merges_idle_seconds_on_status_line() {
+        let blocks = render_agent_blocks(&[AgentListRow {
+            session: "3".to_string(),
+            pane_id: "%6".to_string(),
+            agent: "Codex".to_string(),
+            role: "Captain".to_string(),
+            state: "Idle".to_string(),
+            idle: "24".to_string(),
+            context: "67% left".to_string(),
+            activity: "-".to_string(),
+            tasks: vec!["deadbeef".to_string()],
+        }]);
+        assert!(blocks.contains("Status: Idle (24s)"));
+        assert!(!blocks.contains("\nIdle:"));
+    }
+}
+
 fn show_request(request_id: &str) -> Result<()> {
     validate_request_id(request_id)?;
     let session_name = tmux_session_name()?;
@@ -528,6 +920,308 @@ fn spy_request(request_id: &str) -> Result<()> {
     Ok(())
 }
 
+struct IdleTracker {
+    now_unix_secs: u64,
+    root_dir: PathBuf,
+    cache: std::collections::HashMap<(String, String), Option<u64>>,
+}
+
+impl IdleTracker {
+    fn new(now_unix_secs: u64, root_dir: PathBuf) -> Self {
+        Self {
+            now_unix_secs,
+            root_dir,
+            cache: std::collections::HashMap::new(),
+        }
+    }
+
+    fn update(&mut self, session: &str, pane: &str, state: &pane::AgentState) -> Option<u64> {
+        let key = (session.to_string(), pane.to_string());
+        let previous_idle_since = if let Some(entry) = self.cache.get(&key) {
+            *entry
+        } else {
+            let loaded = self.load_idle_since(session, pane);
+            self.cache.insert(key.clone(), loaded);
+            loaded
+        };
+        let next_idle_since = match state {
+            pane::AgentState::Idle => previous_idle_since.or(Some(self.now_unix_secs)),
+            pane::AgentState::Working | pane::AgentState::Unknown => None,
+        };
+        if previous_idle_since != next_idle_since {
+            let _ = self.persist_idle_since(session, pane, next_idle_since);
+            self.cache.insert(key, next_idle_since);
+        }
+        next_idle_since.map(|since| self.now_unix_secs.saturating_sub(since))
+    }
+
+    fn file_path(&self, session: &str, pane: &str) -> PathBuf {
+        self.root_dir.join(session).join(format!("{pane}.idle"))
+    }
+
+    fn load_idle_since(&self, session: &str, pane: &str) -> Option<u64> {
+        let path = self.file_path(session, pane);
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+    }
+
+    fn persist_idle_since(&self, session: &str, pane: &str, idle_since: Option<u64>) -> Result<()> {
+        let path = self.file_path(session, pane);
+        match idle_since {
+            Some(value) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, value.to_string())?;
+            }
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn format_idle_seconds(idle_seconds: Option<u64>) -> String {
+    idle_seconds
+        .map(|seconds| seconds.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+#[derive(Debug, Clone)]
+struct RequestListRow {
+    session: String,
+    id: String,
+    source: String,
+    target: String,
+    title: Option<String>,
+    age: String,
+    idle_seconds: Option<u64>,
+    response: String,
+}
+
+#[derive(Debug, Clone)]
+struct AgentListRow {
+    session: String,
+    pane_id: String,
+    agent: String,
+    role: String,
+    state: String,
+    idle: String,
+    context: String,
+    activity: String,
+    tasks: Vec<String>,
+}
+
+fn format_idle_for_block(idle_seconds: Option<u64>) -> String {
+    match idle_seconds {
+        Some(seconds) => format!("{seconds}s"),
+        None => "-".to_string(),
+    }
+}
+
+fn parse_context_percent_left(context: &str) -> Option<u64> {
+    let trimmed = context.trim();
+    if let Some(left_idx) = trimmed.find("% left") {
+        let prefix = &trimmed[..left_idx];
+        let digits_start = prefix
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| !ch.is_ascii_digit())
+            .map(|(idx, ch)| idx + ch.len_utf8())
+            .unwrap_or(0);
+        if let Ok(percent) = prefix[digits_start..].trim().parse::<u64>() {
+            return Some(percent.min(100));
+        }
+    }
+    if let Some(tokens_str) = trimmed.strip_suffix(" tokens")
+        && let Ok(tokens) = tokens_str.trim().parse::<u64>()
+    {
+        let percent = tokens.saturating_mul(100) / 200_000;
+        return Some(percent.min(100));
+    }
+    None
+}
+
+fn context_progress_bar(percent_left: u64) -> String {
+    let clamped = percent_left.min(100);
+    let filled = ((clamped + 5) / 10) as usize;
+    let mut bar = String::with_capacity(12);
+    bar.push('[');
+    for i in 0..10 {
+        if i < filled {
+            bar.push('#');
+        } else {
+            bar.push('-');
+        }
+    }
+    bar.push(']');
+    bar
+}
+
+fn format_context_line(context: &str) -> String {
+    let trimmed = context.trim();
+    if trimmed == "-" {
+        return "Context: -".to_string();
+    }
+    if let Some(percent_left) = parse_context_percent_left(trimmed) {
+        if let Some(tokens_str) = trimmed.strip_suffix(" tokens")
+            && let Ok(tokens) = tokens_str.trim().parse::<u64>()
+        {
+            return format!(
+                "Context: {tokens} tokens -> {percent_left}% left {}",
+                context_progress_bar(percent_left)
+            );
+        }
+        return format!(
+            "Context: {percent_left}% left {}",
+            context_progress_bar(percent_left)
+        );
+    }
+    format!("Context: {trimmed}")
+}
+
+fn render_request_blocks(rows: &[RequestListRow]) -> String {
+    let mut blocks = Vec::new();
+    for row in rows {
+        let title = row
+            .title
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("-");
+        blocks.push(format!(
+            "Task: {} @ {} ({} -> {})\nTitle: {}\nAge/Idle/Response: {} / {} / {}",
+            row.id,
+            row.session,
+            row.source,
+            row.target,
+            title,
+            row.age,
+            format_idle_for_block(row.idle_seconds),
+            row.response
+        ));
+    }
+    blocks.join("\n\n")
+}
+
+fn format_status(state: &str, activity: &str) -> String {
+    let activity = activity.trim();
+    let state_lower = state.to_ascii_lowercase();
+    let activity_lower = activity.to_ascii_lowercase();
+
+    if activity != "-" && activity_lower.starts_with(&state_lower) {
+        return activity.to_string();
+    }
+
+    if activity != "-" {
+        return format!("{state} ({activity})");
+    }
+    state.to_string()
+}
+
+fn render_agent_blocks(rows: &[AgentListRow]) -> String {
+    let mut blocks = Vec::new();
+    for row in rows {
+        let mut lines = vec![format!(
+            "Agent: {} @ {}/{} | Role: {}",
+            row.agent, row.session, row.pane_id, row.role
+        )];
+        if !row.tasks.is_empty() {
+            lines.push(format!("Task: {}", row.tasks.join(", ")));
+        }
+        lines.push(format_context_line(&row.context));
+        let base_status = format_status(&row.state, &row.activity);
+        if row.state.eq_ignore_ascii_case("idle") && row.idle != "-" {
+            lines.push(format!("Status: {base_status} ({}s)", row.idle));
+        } else {
+            lines.push(format!("Status: {base_status}"));
+        }
+        blocks.push(lines.join("\n"));
+    }
+    blocks.join("\n\n")
+}
+
+fn render_session_groups(
+    request_rows: &[RequestListRow],
+    agent_rows: &[AgentListRow],
+) -> String {
+    let mut sessions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for row in request_rows {
+        sessions.insert(row.session.clone());
+    }
+    for row in agent_rows {
+        sessions.insert(row.session.clone());
+    }
+
+    let mut out = String::new();
+    let mut first = true;
+    for session in sessions {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+
+        out.push_str(&format!("Session {session}\n"));
+        let session_requests: Vec<RequestListRow> = request_rows
+            .iter()
+            .filter(|row| row.session == session)
+            .cloned()
+            .collect();
+        if !session_requests.is_empty() {
+            out.push_str("Tasks:\n");
+            out.push_str(&render_request_blocks(&session_requests));
+            out.push('\n');
+        }
+
+        let session_agents: Vec<AgentListRow> = agent_rows
+            .iter()
+            .filter(|row| row.session == session)
+            .cloned()
+            .collect();
+        if !session_agents.is_empty() {
+            if !session_requests.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("Agents:\n");
+            out.push_str(&render_agent_blocks(&session_agents));
+            out.push('\n');
+        }
+    }
+
+    out.trim_end().to_string()
+}
+
+fn format_agent_task_summary(request_id: &str, title: Option<&str>) -> String {
+    match title.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(title) => format!("{request_id} ({title})"),
+        None => request_id.to_string(),
+    }
+}
+
+fn classify_agent_role(
+    session: &str,
+    pane_id: &str,
+    requests: &[RequestListRow],
+) -> &'static str {
+    let mut is_source = false;
+    let mut is_target = false;
+    for request in requests.iter().filter(|request| request.session == session) {
+        if request.source == pane_id {
+            is_source = true;
+        }
+        if request.target == pane_id {
+            is_target = true;
+        }
+    }
+    match (is_source, is_target) {
+        (true, false) => "Captain",
+        (false, true) => "Buddy",
+        (true, true) => "Mixed",
+        (false, false) => "Unknown",
+    }
+}
+
 fn list_requests() -> Result<()> {
     use std::time::SystemTime;
 
@@ -538,11 +1232,17 @@ fn list_requests() -> Result<()> {
         target: String,
         title: Option<String>,
         age: String,
-        response: &'static str,
+        idle_seconds: Option<u64>,
+        response: String,
     }
 
     let mut rows: Vec<Row> = Vec::new();
     let now = SystemTime::now();
+    let now_unix_secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let mut idle_tracker = IdleTracker::new(now_unix_secs, idle_tracking_root_dir());
     let request_root = request_root_dir();
     if let Ok(session_entries) = std::fs::read_dir(&request_root) {
         for session_entry in session_entries.flatten() {
@@ -571,10 +1271,21 @@ fn list_requests() -> Result<()> {
                     .and_then(|timestamp| now.duration_since(timestamp).ok())
                     .map(util::format_age)
                     .unwrap_or_else(|| "unknown".to_string());
+                let idle_seconds = tmux::capture_pane(&target_pane)
+                    .ok()
+                    .map(|capture| pane::parse_pane_content(&capture))
+                    .and_then(|parsed| {
+                        if parsed.agent_type.is_some() {
+                            Some(idle_tracker.update(&session_name, &target_pane, &parsed.state))
+                        } else {
+                            None
+                        }
+                    })
+                    .flatten();
                 let response_exists = if session_response_dir.join(format!("{id}.md")).exists() {
-                    "yes"
+                    "yes".to_string()
                 } else {
-                    "no"
+                    "no".to_string()
                 };
                 rows.push(Row {
                     session: session_name.clone(),
@@ -583,6 +1294,7 @@ fn list_requests() -> Result<()> {
                     target: target_pane,
                     title,
                     age,
+                    idle_seconds,
                     response: response_exists,
                 });
             }
@@ -591,48 +1303,34 @@ fn list_requests() -> Result<()> {
 
     if rows.is_empty() {
         eprintln!("No tasks in flight — all clear!");
-    } else {
-        rows.sort_by(|a, b| a.session.cmp(&b.session).then(a.id.cmp(&b.id)));
-        let show_title = rows.iter().any(|r| r.title.is_some());
-        if show_title {
-            eprintln!(
-                "SESSION              REQUEST     SOURCE        TARGET       TITLE                      AGE         RESPONSE"
-            );
-            eprintln!(
-                "-------------------  ----------  ------------  -----------  -------------------------  ----------  --------"
-            );
-            for r in &rows {
-                eprintln!(
-                    "{:<19}  {:<10}  {:<12}  {:<11}  {:<25}  {:<10}  {}",
-                    r.session,
-                    r.id,
-                    r.source,
-                    r.target,
-                    r.title.as_deref().unwrap_or("-"),
-                    r.age,
-                    r.response
-                );
-            }
-        } else {
-            eprintln!(
-                "SESSION              REQUEST     SOURCE        TARGET       AGE         RESPONSE"
-            );
-            eprintln!(
-                "-------------------  ----------  ------------  -----------  ----------  --------"
-            );
-            for r in &rows {
-                eprintln!(
-                    "{:<19}  {:<10}  {:<12}  {:<11}  {:<10}  {}",
-                    r.session, r.id, r.source, r.target, r.age, r.response
-                );
-            }
-        }
     }
 
-    eprintln!();
+    rows.sort_by(|a, b| a.session.cmp(&b.session).then(a.id.cmp(&b.id)));
+    let request_rows: Vec<RequestListRow> = rows
+        .iter()
+        .map(|row| RequestListRow {
+            session: row.session.clone(),
+            id: row.id.clone(),
+            source: row.source.clone(),
+            target: row.target.clone(),
+            title: row.title.clone(),
+            age: row.age.clone(),
+            idle_seconds: row.idle_seconds,
+            response: row.response.clone(),
+        })
+        .collect();
+
     match tmux::list_all_panes() {
         Ok(panes) => {
-            let mut agent_rows: Vec<(String, String, String, String, String, String)> = Vec::new();
+            let mut tasks_by_agent: std::collections::HashMap<(String, String), Vec<String>> =
+                std::collections::HashMap::new();
+            for row in &rows {
+                tasks_by_agent
+                    .entry((row.session.clone(), row.target.clone()))
+                    .or_default()
+                    .push(format_agent_task_summary(&row.id, row.title.as_deref()));
+            }
+            let mut agent_rows: Vec<AgentListRow> = Vec::new();
             for p in &panes {
                 let capture = tmux::capture_pane(&p.id).unwrap_or_default();
                 let parsed = pane::parse_pane_content(&capture);
@@ -648,37 +1346,29 @@ fn list_requests() -> Result<()> {
                     pane::AgentState::Idle => "Idle",
                     pane::AgentState::Unknown => "Unknown",
                 };
+                let idle_seconds = idle_tracker.update(&p.session_name, &p.id, &parsed.state);
                 let context = parsed.context_remaining.unwrap_or_else(|| "-".to_string());
                 let activity = parsed
                     .activity
                     .map(|value| value.replace('\n', " "))
                     .unwrap_or_else(|| "-".to_string());
-                agent_rows.push((
-                    p.session_name.clone(),
-                    p.id.clone(),
-                    agent.to_string(),
-                    state.to_string(),
+                agent_rows.push(AgentListRow {
+                    session: p.session_name.clone(),
+                    pane_id: p.id.clone(),
+                    agent: agent.to_string(),
+                    role: classify_agent_role(&p.session_name, &p.id, &request_rows).to_string(),
+                    state: state.to_string(),
+                    idle: format_idle_seconds(idle_seconds),
                     context,
                     activity,
-                ));
+                    tasks: tasks_by_agent
+                        .get(&(p.session_name.clone(), p.id.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
+                });
             }
 
-            if agent_rows.is_empty() {
-                eprintln!("No agent panes detected.");
-            } else {
-                eprintln!(
-                    "SESSION              PANE       AGENT    STATE    CONTEXT            ACTIVITY"
-                );
-                eprintln!(
-                    "-------------------  ---------  -------  -------  -----------------  ----------------------------------------"
-                );
-                for (session, pane_id, agent, state, context, activity) in agent_rows {
-                    eprintln!(
-                        "{:<19}  {:<9}  {:<7}  {:<7}  {:<17}  {}",
-                        session, pane_id, agent, state, context, activity
-                    );
-                }
-            }
+            eprintln!("{}", render_session_groups(&request_rows, &agent_rows));
         }
         Err(e) => {
             eprintln!("Panes unavailable: {e}");
@@ -935,6 +1625,46 @@ struct PendingIssueFailed {
     error: String,
 }
 
+#[derive(Clone, Copy)]
+enum DraftMissingStage {
+    BeforeRead,
+    AfterCreate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftCleanupOutcome {
+    Removed,
+    Missing,
+}
+
+fn format_missing_draft_message(
+    path: &std::path::Path,
+    stage: DraftMissingStage,
+    has_concurrency_evidence: bool,
+) -> String {
+    let base = match stage {
+        DraftMissingStage::BeforeRead => {
+            format!("Skipping draft {}: file disappeared before read.", path.display())
+        }
+        DraftMissingStage::AfterCreate => {
+            format!("Draft {} already removed after create.", path.display())
+        }
+    };
+    if has_concurrency_evidence {
+        format!("{base} Concurrent `bud issues` run detected.")
+    } else {
+        base
+    }
+}
+
+fn cleanup_created_draft(path: &std::path::Path) -> std::io::Result<DraftCleanupOutcome> {
+    match fs_err::remove_file(path) {
+        Ok(()) => Ok(DraftCleanupOutcome::Removed),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DraftCleanupOutcome::Missing),
+        Err(e) => Err(e),
+    }
+}
+
 fn process_pending_issue_drafts(
     repo: &str,
 ) -> Result<(Vec<PendingIssueCreated>, Vec<PendingIssueFailed>)> {
@@ -974,8 +1704,8 @@ fn process_pending_issue_drafts(
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
                     eprintln!(
-                        "Skipping draft {}: file disappeared before read (likely concurrent `bud issues` run).",
-                        path.display()
+                        "{}",
+                        format_missing_draft_message(&path, DraftMissingStage::BeforeRead, false)
                     );
                     continue;
                 }
@@ -1039,13 +1769,19 @@ fn process_pending_issue_drafts(
 
         match github::create_issue(repo, &draft) {
             Ok((number, url)) => {
-                if let Err(e) = fs_err::remove_file(&path) {
-                    if e.kind() == ErrorKind::NotFound {
+                match cleanup_created_draft(&path) {
+                    Ok(DraftCleanupOutcome::Removed) => {}
+                    Ok(DraftCleanupOutcome::Missing) => {
                         eprintln!(
-                            "Draft {} already removed after create (likely concurrent run).",
-                            path.display()
+                            "{}",
+                            format_missing_draft_message(
+                                &path,
+                                DraftMissingStage::AfterCreate,
+                                false
+                            )
                         );
-                    } else {
+                    }
+                    Err(e) => {
                         if let Err(move_err) = move_file(&path, &failed_dir.join(&original_name)) {
                             eprintln!("Failed {original_name}: move_to_failed_failed: {move_err}");
                         }
