@@ -9,6 +9,7 @@ mod protocol;
 mod server;
 mod listing;
 mod issues;
+mod requests;
 mod tmux;
 mod util;
 mod warmth;
@@ -18,7 +19,7 @@ use eyre::Result;
 use facet::Facet;
 use figue as args;
 use paths::{
-    log_path, pid_path, read_stdin, request_dir, request_root_dir, response_root_dir, socket_path,
+    log_path, pid_path, read_stdin, request_root_dir, response_root_dir, socket_path,
     tmux_session_name, tmux_session_name_for_pane,
 };
 
@@ -184,13 +185,13 @@ async fn main() -> Result<()> {
         }
         Some(Command::List) => listing::list_requests(),
         Some(Command::Cancel { request_id }) => client::cancel_request(&request_id).await,
-        Some(Command::Show { request_id }) => show_request(&request_id),
-        Some(Command::Spy { request_id }) => spy_request(&request_id),
+        Some(Command::Show { request_id }) => requests::show_request(&request_id),
+        Some(Command::Spy { request_id }) => requests::spy_request(&request_id),
         Some(Command::Steer { request_id }) => client::steer_request(&request_id).await,
         Some(Command::Accept { request_id }) => client::accept_request(&request_id).await,
         Some(Command::Update { request_id }) => client::update_request(&request_id).await,
         Some(Command::Issues) => issues::sync_issues_to_pane(),
-        Some(Command::Compact) => compact_context(),
+        Some(Command::Compact) => requests::compact_context(),
         Some(Command::Assign { keep, title, issue }) => {
             let pane = std::env::var("TMUX_PANE")
                 .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
@@ -216,68 +217,13 @@ async fn main() -> Result<()> {
     }
 }
 
-fn compact_context() -> Result<()> {
-    let summary = read_stdin()?;
-    let pane = std::env::var("TMUX_PANE")
-        .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
 
-    let list_output = std::process::Command::new("mate").arg("list").output()?;
-    let task_list = if list_output.status.success() {
-        let stdout = String::from_utf8_lossy(&list_output.stdout)
-            .trim()
-            .to_string();
-        if stdout.is_empty() {
-            "none".to_string()
-        } else {
-            stdout
-        }
-    } else {
-        "none".to_string()
-    };
-
-    let prompt = format!(
-        "/captain\nYou've just been compacted. Here is your context summary from before compaction:\n\n{summary}\n\nIn-flight tasks at time of compaction:\n{task_list}"
-    );
-
-    tmux::send_to_pane(&pane, "/clear")?;
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    tmux::send_to_pane(&pane, &prompt)?;
-    Ok(())
-}
-
-fn show_request(request_id: &str) -> Result<()> {
-    client::validate_request_id(request_id)?;
-    let session_name = tmux_session_name()?;
-    let path = request_dir(&session_name).join(request_id);
-    let meta = util::read_request_meta(&path)
-        .ok_or_else(|| eyre::eyre!("No task with ID {request_id} found."))?;
-    let content = util::read_request_content(&path)
-        .ok_or_else(|| eyre::eyre!("Task {request_id} is missing request content."))?;
-    eprintln!("Task {request_id}");
-    eprintln!("Source: {}  Target: {}", meta.source_pane, meta.target_pane);
-    eprintln!("Title: {}", meta.title.as_deref().unwrap_or("(none)"));
-    eprintln!();
-    eprintln!("{content}");
-    Ok(())
-}
-
-fn spy_request(request_id: &str) -> Result<()> {
-    client::validate_request_id(request_id)?;
-    let session_name = tmux_session_name()?;
-    let path = request_dir(&session_name).join(request_id);
-    let meta = util::read_request_meta(&path)
-        .ok_or_else(|| eyre::eyre!("No task with ID {request_id} found."))?;
-    let pane_content = tmux::capture_pane(&meta.target_pane)?;
-    eprintln!("Pane {}:\n{}", meta.target_pane, pane_content);
-    Ok(())
-}
-
- 
 #[cfg(test)]
 mod tests {
     use crate::issues::{
         cleanup_created_draft, format_missing_draft_message, DraftCleanupOutcome, DraftMissingStage,
     };
+    use crate::requests::format_captain_update_for_buddy;
     use crate::listing::{
         AgentListRow, IdleTracker, RequestListRow,
         classify_agent_role, format_agent_task_summary, format_context_line, format_idle_seconds,
@@ -285,17 +231,6 @@ mod tests {
         render_session_groups,
     };
     use std::path::{Path, PathBuf};
-
-    fn format_captain_update_for_buddy(request_id: &str, message: &str) -> String {
-        format!(
-            "📌 Update from the captain on task {request_id}:\n\n\
-             {message}\n\n\
-             If you hit a decision point, want to share progress, or need clarification, send an update:\n\n\
-             cat <<'MATEEOF' | mate update {request_id}\n\
-             <your progress update here>\n\
-             MATEEOF"
-        )
-    }
 
     #[test]
     fn captain_update_includes_buddy_response_instructions() {
