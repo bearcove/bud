@@ -807,6 +807,16 @@ fn diff_issue_fields(old: &ParsedIssueFile, new: &ParsedIssueFile) -> IssueField
 }
 
 impl IssueFieldDiff {
+    fn has_non_state_edits(&self) -> bool {
+        self.title.is_some()
+            || self.body.is_some()
+            || self.milestone.is_some()
+            || !self.added_labels.is_empty()
+            || !self.removed_labels.is_empty()
+            || !self.added_assignees.is_empty()
+            || !self.removed_assignees.is_empty()
+    }
+
     fn is_empty(&self) -> bool {
         self.title.is_none()
             && self.state.is_none()
@@ -824,7 +834,12 @@ impl IssueFieldDiff {
             changes.push("changed title".to_string());
         }
         if let Some(state) = self.state.as_deref() {
-            changes.push(format!("state -> {state}"));
+            let state_change = match state {
+                "closed" => "closed issue".to_string(),
+                "open" => "reopened issue".to_string(),
+                other => format!("state -> {other}"),
+            };
+            changes.push(state_change);
         }
         if self.body.is_some() {
             changes.push("updated body".to_string());
@@ -858,38 +873,40 @@ fn apply_issue_edits(repo: &str, edited: &ParsedIssueFile, diff: &IssueFieldDiff
         return Ok(());
     }
 
-    let mut cmd = Command::new("gh");
-    cmd.args(["issue", "edit", "-R", repo, &edited.number.to_string()]);
+    if diff.has_non_state_edits() {
+        let mut cmd = Command::new("gh");
+        cmd.args(["issue", "edit", "-R", repo, &edited.number.to_string()]);
 
-    if let Some(title) = diff.title.as_deref() {
-        cmd.args(["--title", title]);
-    }
-    if let Some(body) = diff.body.as_deref() {
-        cmd.args(["--body", body]);
-    }
-    if let Some(milestone) = diff.milestone.as_ref() {
-        match milestone.as_deref() {
-            Some(value) => cmd.args(["--milestone", value]),
-            None => cmd.args(["--milestone", ""]),
-        };
-    }
-    for label in &diff.added_labels {
-        cmd.args(["--add-label", label]);
-    }
-    for label in &diff.removed_labels {
-        cmd.args(["--remove-label", label]);
-    }
-    for assignee in &diff.added_assignees {
-        cmd.args(["--add-assignee", assignee]);
-    }
-    for assignee in &diff.removed_assignees {
-        cmd.args(["--remove-assignee", assignee]);
-    }
+        if let Some(title) = diff.title.as_deref() {
+            cmd.args(["--title", title]);
+        }
+        if let Some(body) = diff.body.as_deref() {
+            cmd.args(["--body", body]);
+        }
+        if let Some(milestone) = diff.milestone.as_ref() {
+            match milestone.as_deref() {
+                Some(value) => cmd.args(["--milestone", value]),
+                None => cmd.args(["--milestone", ""]),
+            };
+        }
+        for label in &diff.added_labels {
+            cmd.args(["--add-label", label]);
+        }
+        for label in &diff.removed_labels {
+            cmd.args(["--remove-label", label]);
+        }
+        for assignee in &diff.added_assignees {
+            cmd.args(["--add-assignee", assignee]);
+        }
+        for assignee in &diff.removed_assignees {
+            cmd.args(["--remove-assignee", assignee]);
+        }
 
-    let output = cmd.output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(eyre::eyre!("gh issue edit failed: {stderr}"));
+        let output = cmd.output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(eyre::eyre!("gh issue edit failed: {stderr}"));
+        }
     }
 
     if let Some(state) = diff.state.as_deref() {
@@ -922,6 +939,45 @@ fn apply_issue_edits(repo: &str, edited: &ParsedIssueFile, diff: &IssueFieldDiff
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IssueFieldDiff;
+
+    #[test]
+    fn has_non_state_edits_false_for_state_only_diff() {
+        let diff = IssueFieldDiff {
+            state: Some("closed".to_string()),
+            ..IssueFieldDiff::default()
+        };
+        assert!(!diff.has_non_state_edits());
+    }
+
+    #[test]
+    fn has_non_state_edits_true_when_other_fields_change() {
+        let diff = IssueFieldDiff {
+            state: Some("closed".to_string()),
+            body: Some("updated".to_string()),
+            ..IssueFieldDiff::default()
+        };
+        assert!(diff.has_non_state_edits());
+    }
+
+    #[test]
+    fn changes_reports_close_and_reopen_actions() {
+        let close_diff = IssueFieldDiff {
+            state: Some("closed".to_string()),
+            ..IssueFieldDiff::default()
+        };
+        assert_eq!(close_diff.changes(31), vec!["closed issue"]);
+
+        let reopen_diff = IssueFieldDiff {
+            state: Some("open".to_string()),
+            ..IssueFieldDiff::default()
+        };
+        assert_eq!(reopen_diff.changes(31), vec!["reopened issue"]);
+    }
 }
 
 pub fn create_issue(repo: &str, issue: &NewIssue) -> Result<(u64, String)> {
