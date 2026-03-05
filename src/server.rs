@@ -5,7 +5,7 @@ use eyre::Result;
 use fs_err::tokio as fs;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use roam_stream::StreamLink;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,8 +14,6 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 
-const STALENESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
-const STALENESS_NOTIFY_AFTER_UNCHANGED: u32 = 4;
 const IDLE_NUDGE_AFTER: Duration = Duration::from_secs(60);
 const IDLE_NOTIFY_DELAY: Duration = Duration::from_secs(30);
 
@@ -34,11 +32,6 @@ struct Waiter {
 }
 
 struct PaneState {
-    last_content: String,
-    unchanged_count: u32,
-    captain_last_content: String,
-    captain_unchanged_count: u32,
-    notified: bool,
     idle_since: Option<Instant>,
     idle_nudged: bool,
 }
@@ -808,24 +801,19 @@ async fn watch_responses(
     )
     .await;
 
-    let mut staleness_tick = tokio::time::interval(STALENESS_SAMPLE_INTERVAL);
     let mut poll_tick = tokio::time::interval(Duration::from_secs(2));
+    let mut idle_tick = tokio::time::interval(Duration::from_secs(30));
 
     loop {
         if watcher.is_some() {
             tokio::select! {
-                _ = staleness_tick.tick() => {
-                    run_staleness_checks(
-                        &request_root_dir,
-                        &response_root_dir,
-                        &idle_states,
-                        &mut pane_states,
-                    ).await;
-                    maybe_notify_idle(&idle_states, discord_webhook_url.as_deref()).await;
+                _ = poll_tick.tick() => {
+                    run_idle_nudge_checks(&request_root_dir, &response_root_dir, &mut pane_states).await;
                 }
                 maybe_event = event_rx.recv() => {
                     match maybe_event {
                         Some(Ok(event)) if matches!(event.kind, EventKind::Create(_)) => {
+                            run_idle_nudge_checks(&request_root_dir, &response_root_dir, &mut pane_states).await;
                             process_response_files(
                                 &response_root_dir,
                                 &request_root_dir,
@@ -845,19 +833,14 @@ async fn watch_responses(
                         }
                     }
                 }
+                _ = idle_tick.tick() => {
+                    maybe_notify_idle(&idle_states, discord_webhook_url.as_deref()).await;
+                }
             }
         } else {
             tokio::select! {
-                _ = staleness_tick.tick() => {
-                    run_staleness_checks(
-                        &request_root_dir,
-                        &response_root_dir,
-                        &idle_states,
-                        &mut pane_states,
-                    ).await;
-                    maybe_notify_idle(&idle_states, discord_webhook_url.as_deref()).await;
-                }
                 _ = poll_tick.tick() => {
+                    run_idle_nudge_checks(&request_root_dir, &response_root_dir, &mut pane_states).await;
                     process_response_files(
                         &response_root_dir,
                         &request_root_dir,
@@ -865,7 +848,120 @@ async fn watch_responses(
                         &idle_states,
                         &mut pane_states,
                     )
-                    .await;
+                        .await;
+                }
+                _ = idle_tick.tick() => {
+                    maybe_notify_idle(&idle_states, discord_webhook_url.as_deref()).await;
+                }
+            }
+        }
+    }
+}
+
+async fn run_idle_nudge_checks(
+    request_root_dir: &Path,
+    response_root_dir: &Path,
+    pane_states: &mut HashMap<String, PaneState>,
+) {
+    let mut session_entries = match fs::read_dir(request_root_dir).await {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    while let Ok(Some(session_entry)) = session_entries.next_entry().await {
+        let session_path = session_entry.path();
+        let session_name = match session_entry.file_name().to_str() {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        let Ok(file_type) = session_entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let mut request_entries = match fs::read_dir(&session_path).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        while let Ok(Some(request_entry)) = request_entries.next_entry().await {
+            let request_path = request_entry.path();
+            let Ok(file_type) = request_entry.file_type().await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let request_id = match request_entry.file_name().to_str() {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            let key = request_key(&session_name, &request_id);
+
+            let response_path = response_root_dir
+                .join(&session_name)
+                .join(format!("{request_id}.md"));
+            if fs::metadata(&response_path).await.is_ok() {
+                pane_states.remove(&key);
+                continue;
+            }
+
+            let meta = match crate::util::read_request_meta(&request_path).await {
+                Some(meta) => meta,
+                None => continue,
+            };
+
+            let parsed_pane_state =
+                match tmux::TmuxPane::new(pane::PaneId(meta.target_pane.clone()))
+                    .snapshot()
+                    .await
+                {
+                    Ok(state) => state,
+                    Err(e) => {
+                        error!(
+                            "failed to snapshot target pane {} for request {}: {e}",
+                            meta.target_pane, request_id
+                        );
+                        continue;
+                    }
+                };
+
+            let state = pane_states.entry(key).or_insert_with(|| PaneState {
+                idle_since: None,
+                idle_nudged: false,
+            });
+
+            if matches!(parsed_pane_state.state, pane::AgentState::Idle) {
+                if state.idle_since.is_none() {
+                    state.idle_since = Some(Instant::now());
+                }
+            } else {
+                state.idle_since = None;
+            }
+
+            if !state.idle_nudged
+                && let Some(idle_since) = state.idle_since
+                && idle_since.elapsed() >= IDLE_NUDGE_AFTER
+            {
+                let buddy_reminder = format!(
+                    "⚠️ You have an open task (ID: {request_id}) but appear to be idle.\nPlease send an update:\n\ncat <<'EOF' | mate update {request_id}\n<summary of what you did>\nEOF"
+                );
+                match tmux::TmuxPane::new(pane::PaneId(meta.target_pane.clone()))
+                    .chat_message(&buddy_reminder)
+                    .await
+                {
+                    Ok(()) => {
+                        state.idle_nudged = true;
+                    }
+                    Err(e) => {
+                        error!(
+                            "failed to send idle nudge to mate pane {} for request {}: {e}",
+                            meta.target_pane, request_id
+                        );
+                    }
                 }
             }
         }
@@ -993,221 +1089,6 @@ async fn maybe_notify_idle(
             continue;
         }
     }
-}
-
-async fn run_staleness_checks(
-    request_root_dir: &Path,
-    response_root_dir: &Path,
-    idle_states: &Arc<Mutex<HashMap<String, IdleState>>>,
-    pane_states: &mut HashMap<String, PaneState>,
-) {
-    let mut active_request_keys: HashSet<String> = HashSet::new();
-
-    let mut session_entries = match fs::read_dir(request_root_dir).await {
-        Ok(entries) => entries,
-        Err(_) => {
-            pane_states.clear();
-            return;
-        }
-    };
-
-    while let Ok(Some(session_entry)) = session_entries.next_entry().await {
-        let session_path = session_entry.path();
-        let session_name = match session_entry.file_name().to_str() {
-            Some(name) => name.to_string(),
-            None => continue,
-        };
-        let Ok(file_type) = session_entry.file_type().await else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-
-        let mut request_entries = match fs::read_dir(&session_path).await {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-
-        while let Ok(Some(request_entry)) = request_entries.next_entry().await {
-            let request_path = request_entry.path();
-            let Ok(file_type) = request_entry.file_type().await else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-
-            let request_id = match request_entry.file_name().to_str() {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-            let key = request_key(&session_name, &request_id);
-            active_request_keys.insert(key.clone());
-
-            let response_path = response_root_dir
-                .join(&session_name)
-                .join(format!("{request_id}.md"));
-            if fs::metadata(&response_path).await.is_ok() {
-                continue;
-            }
-
-            let meta = match crate::util::read_request_meta(&request_path).await {
-                Some(meta) => meta,
-                None => continue,
-            };
-            let target_pane = tmux::TmuxPane::new(pane::PaneId(meta.target_pane.clone()));
-            let parsed_pane_state = match target_pane.snapshot().await {
-                Ok(state) => state,
-                Err(e) => {
-                    error!(
-                        "failed to snapshot pane {} for request {}: {e}",
-                        meta.target_pane, request_id
-                    );
-                    continue;
-                }
-            };
-            let pane_content = match tmux::capture_pane(&meta.target_pane).await {
-                Ok(content) => content,
-                Err(e) => {
-                    error!(
-                        "failed to capture pane {} for request {}: {e}",
-                        meta.target_pane, request_id
-                    );
-                    continue;
-                }
-            };
-            {
-                let mut states = idle_states.lock().await;
-                let state = states.entry(session_name.clone()).or_insert(IdleState {
-                    empty_since: None,
-                    notified: false,
-                    last_title: None,
-                    source_pane: None,
-                    last_pane_content: None,
-                    pane_unchanged_since: None,
-                    parsed_pane_state: None,
-                });
-                state.parsed_pane_state = Some(parsed_pane_state.clone());
-            }
-
-            if matches!(parsed_pane_state.state, pane::AgentState::Unknown) {
-                let unparsed = pane_content
-                    .lines()
-                    .rev()
-                    .take(20)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                warn!(
-                    "UNPARSED_PANE: session={} request={} pane={}\n{}",
-                    session_name, request_id, meta.target_pane, unparsed
-                );
-            } else if matches!(parsed_pane_state.state, pane::AgentState::Idle) {
-                info!("Mate appears idle on task {request_id} without responding");
-            }
-
-            let state = pane_states.entry(key).or_insert_with(|| PaneState {
-                last_content: pane_content.clone(),
-                unchanged_count: 0,
-                captain_last_content: String::new(),
-                captain_unchanged_count: 0,
-                notified: false,
-                idle_since: None,
-                idle_nudged: false,
-            });
-
-            if matches!(parsed_pane_state.state, pane::AgentState::Idle) {
-                if state.idle_since.is_none() {
-                    state.idle_since = Some(Instant::now());
-                }
-            } else {
-                state.idle_since = None;
-            }
-
-            if !state.idle_nudged
-                && let Some(idle_since) = state.idle_since
-                && idle_since.elapsed() >= IDLE_NUDGE_AFTER
-            {
-                let buddy_reminder = format!(
-                    "⚠️ You have an open task (ID: {request_id}) but appear to be idle.\nPlease send an update:\n\ncat <<'EOF' | mate update {request_id}\n<summary of what you did>\nEOF"
-                );
-                match tmux::TmuxPane::new(pane::PaneId(meta.target_pane.clone()))
-                    .chat_message(&buddy_reminder)
-                    .await
-                {
-                    Ok(()) => {
-                        state.idle_nudged = true;
-                    }
-                    Err(e) => {
-                        error!(
-                            "failed to send idle nudge to mate pane {} for request {}: {e}",
-                            meta.target_pane, request_id
-                        );
-                    }
-                }
-            }
-
-            if pane_content == state.last_content {
-                state.unchanged_count += 1;
-            } else {
-                state.last_content = pane_content.clone();
-                state.unchanged_count = 0;
-                state.notified = false;
-            }
-
-            let captain_pane_content = match tmux::capture_pane(&meta.source_pane).await {
-                Ok(content) => content,
-                Err(e) => {
-                    error!(
-                        "failed to capture captain pane {} for request {}: {e}",
-                        meta.source_pane, request_id
-                    );
-                    continue;
-                }
-            };
-
-            if captain_pane_content == state.captain_last_content {
-                state.captain_unchanged_count += 1;
-            } else {
-                state.captain_last_content = captain_pane_content;
-                state.captain_unchanged_count = 0;
-                state.notified = false;
-            }
-
-            if state.notified
-                || state.unchanged_count < STALENESS_NOTIFY_AFTER_UNCHANGED
-                || state.captain_unchanged_count < STALENESS_NOTIFY_AFTER_UNCHANGED
-            {
-                continue;
-            }
-
-            let title_suffix = meta
-                .title
-                .as_deref()
-                .map(|title| format!(" ({title})"))
-                .unwrap_or_default();
-            let message = format!(
-                "⏰ Hey captain — your mate seems stuck on task {request_id}{title_suffix}. Both panes have been unchanged for 2 minutes.\n\nMate pane content:\n```\n{pane_content}\n```"
-            );
-            if let Err(e) = tmux::TmuxPane::new(pane::PaneId(meta.source_pane.clone()))
-                .chat_message(&message)
-                .await
-            {
-                error!(
-                    "failed to deliver staleness notification for request {} to pane {}: {e}",
-                    request_id, meta.source_pane
-                );
-                continue;
-            }
-
-            state.notified = true;
-        }
-    }
-
-    pane_states.retain(|key, _| active_request_keys.contains(key));
 }
 
 async fn process_response_files(
