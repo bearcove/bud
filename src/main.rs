@@ -5,6 +5,7 @@ mod hash;
 mod pane;
 mod protocol;
 mod server;
+mod paths;
 mod tmux;
 mod util;
 mod warmth;
@@ -12,9 +13,21 @@ mod warmth;
 use eyre::Result;
 use facet::Facet;
 use figue as args;
-use std::io::Read as _;
 use std::path::PathBuf;
 use tracing::trace;
+use paths::{
+    idle_tracking_root_dir,
+    log_path,
+    pid_path,
+    read_stdin,
+    request_dir,
+    request_root_dir,
+    response_dir,
+    response_root_dir,
+    socket_path,
+    tmux_session_name,
+    tmux_session_name_for_pane,
+};
 
 #[derive(Facet, Debug)]
 struct Args {
@@ -144,69 +157,6 @@ ENVIRONMENT:
     TMUX_PANE    Automatically set by tmux. Used to identify your pane.
     MATE_SOCKET   Override the server socket path (default: /tmp/mate.sock)
 "#;
-
-fn socket_path() -> PathBuf {
-    std::env::var("MATE_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/mate.sock"))
-}
-
-fn pid_path() -> PathBuf {
-    PathBuf::from("/tmp/mate.pid")
-}
-
-fn response_root_dir() -> PathBuf {
-    PathBuf::from("/tmp/mate-responses")
-}
-
-fn response_dir(session_name: &str) -> PathBuf {
-    response_root_dir().join(session_name)
-}
-
-fn request_root_dir() -> PathBuf {
-    PathBuf::from("/tmp/mate-requests")
-}
-
-fn request_dir(session_name: &str) -> PathBuf {
-    request_root_dir().join(session_name)
-}
-
-fn idle_tracking_root_dir() -> PathBuf {
-    PathBuf::from("/tmp/mate-idle")
-}
-
-fn log_path() -> PathBuf {
-    PathBuf::from("/tmp/mate-server.log")
-}
-
-fn tmux_session_name_for_pane(pane: &str) -> Result<String> {
-    let output = std::process::Command::new("tmux")
-        .args(["display-message", "-t", pane, "-p", "#{session_name}"])
-        .output()?;
-    if !output.status.success() {
-        return Err(eyre::eyre!("tmux display-message failed for pane {pane}"));
-    }
-    let session_name = String::from_utf8(output.stdout)?.trim().to_string();
-    if session_name.is_empty() {
-        return Err(eyre::eyre!("tmux returned empty session name"));
-    }
-    Ok(session_name)
-}
-
-fn tmux_session_name() -> Result<String> {
-    let pane = std::env::var("TMUX_PANE")
-        .map_err(|_| eyre::eyre!("TMUX_PANE not set — are you inside tmux?"))?;
-    tmux_session_name_for_pane(&pane)
-}
-
-fn read_stdin() -> Result<String> {
-    let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf)?;
-    if buf.trim().is_empty() {
-        return Err(eyre::eyre!("no input on stdin"));
-    }
-    Ok(buf)
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
