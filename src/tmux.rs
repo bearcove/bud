@@ -1,6 +1,7 @@
 use crate::pane;
 use eyre::Result;
 use rand::prelude::IndexedRandom;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 const EMOJI_POOL: &[&str] = &[
     "🌵", "🍄", "🦊", "🐙", "🎯", "🔮", "🧊", "🪐", "🦑", "🎪", "🌋", "🦎", "🪸", "🧿", "🫧", "🪬",
@@ -28,10 +29,10 @@ fn prepare_outgoing_text(text: &str, marker: &str) -> String {
     format!("{text} {marker}")
 }
 
-pub struct Pane {
-    pub id: String,
-    pub pid: u32,
-    pub session_name: String,
+struct TmuxPaneInfo {
+    id: String,
+    pid: u32,
+    session_name: String,
 }
 
 pub struct TmuxPane {
@@ -75,8 +76,8 @@ impl TmuxPaneDiscovery {
         &self,
         me: &crate::pane::PaneId,
     ) -> Result<(crate::pane::PaneId, std::sync::Arc<dyn pane::Pane>)> {
-        let pane = find_other_pane(&me.0).await?;
-        let pane_id = crate::pane::PaneId(pane.id);
+        let pane = find_peer_in_same_session(&me.0).await?;
+        let pane_id = crate::pane::PaneId(pane.id.clone());
         Ok((pane_id.clone(), std::sync::Arc::new(TmuxPane::new(pane_id))))
     }
 }
@@ -84,14 +85,14 @@ impl TmuxPaneDiscovery {
 #[async_trait::async_trait]
 impl pane::PaneDiscovery for TmuxPaneDiscovery {
     async fn find_peer(&self, me: &crate::pane::PaneId) -> Result<std::sync::Arc<dyn pane::Pane>> {
-        let pane = find_other_pane(&me.0).await?;
+        let pane = find_peer_in_same_session(&me.0).await?;
         Ok(std::sync::Arc::new(TmuxPane::new(pane::PaneId(pane.id))))
     }
 
     async fn list_all(&self) -> Result<Vec<pane::DiscoveredPane>> {
         use std::collections::HashSet;
 
-        let panes = list_all_panes().await?;
+        let panes = list_all_tmux_panes().await?;
         let mut discovered: Vec<pane::DiscoveredPane> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
@@ -112,9 +113,19 @@ impl pane::PaneDiscovery for TmuxPaneDiscovery {
     }
 }
 
-/// List tmux panes in the same session as the given pane.
-pub async fn list_panes(pane_id: &str) -> Result<Vec<Pane>> {
-    // Find which session this pane belongs to
+fn parse_pane_entry(line: &str) -> Option<TmuxPaneInfo> {
+    let mut parts = line.splitn(3, '\t');
+    let id = parts.next()?.to_string();
+    let pid = parts.next()?.parse().ok()?;
+    let session_name = parts.next()?.to_string();
+    Some(TmuxPaneInfo {
+        id,
+        pid,
+        session_name,
+    })
+}
+
+async fn session_for_pane(pane_id: &str) -> Result<String> {
     let session_output = tokio::process::Command::new("tmux")
         .args(["display-message", "-t", pane_id, "-p", "#{session_id}"])
         .output()
@@ -124,45 +135,30 @@ pub async fn list_panes(pane_id: &str) -> Result<Vec<Pane>> {
             "tmux display-message failed for pane {pane_id}"
         ));
     }
-    let session_id = String::from_utf8(session_output.stdout)?.trim().to_string();
+    Ok(String::from_utf8(session_output.stdout)?.trim().to_string())
+}
 
+async fn list_panes_in_session(session_name: &str) -> Result<Vec<TmuxPaneInfo>> {
     let output = tokio::process::Command::new("tmux")
         .args([
             "list-panes",
             "-t",
-            &session_id,
+            session_name,
             "-s",
             "-F",
             "#{pane_id}\t#{pane_pid}\t#{session_name}",
         ])
         .output()
         .await?;
-
     if !output.status.success() {
         return Err(eyre::eyre!("tmux list-panes failed"));
     }
 
     let stdout = String::from_utf8(output.stdout)?;
-    let panes = stdout
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
-            let id = parts.next()?.to_string();
-            let pid = parts.next()?.parse().ok()?;
-            let session_name = parts.next()?.to_string();
-            Some(Pane {
-                id,
-                pid,
-                session_name,
-            })
-        })
-        .collect();
-
-    Ok(panes)
+    Ok(stdout.lines().filter_map(parse_pane_entry).collect())
 }
 
-/// List all tmux panes across all sessions.
-pub async fn list_all_panes() -> Result<Vec<Pane>> {
+async fn list_all_tmux_panes() -> Result<Vec<TmuxPaneInfo>> {
     let output = tokio::process::Command::new("tmux")
         .args([
             "list-panes",
@@ -177,21 +173,7 @@ pub async fn list_all_panes() -> Result<Vec<Pane>> {
     }
 
     let stdout = String::from_utf8(output.stdout)?;
-    let panes = stdout
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
-            let id = parts.next()?.to_string();
-            let pid = parts.next()?.parse().ok()?;
-            let session_name = parts.next()?.to_string();
-            Some(Pane {
-                id,
-                pid,
-                session_name,
-            })
-        })
-        .collect();
-    Ok(panes)
+    Ok(stdout.lines().filter_map(parse_pane_entry).collect())
 }
 
 async fn capture_pane_contents(pane_id: &str) -> Result<String> {
@@ -328,21 +310,6 @@ async fn send_pane_with_marker(pane_id: &str, text: &str, marker: &str) -> Resul
     Ok(())
 }
 
-fn child_process_names(sys: &sysinfo::System, pane: &Pane) -> Vec<String> {
-    use sysinfo::Pid;
-
-    let parent = Pid::from_u32(pane.pid);
-    let mut names: Vec<String> = sys
-        .processes()
-        .values()
-        .filter(|proc| proc.parent() == Some(parent))
-        .filter_map(|proc| proc.name().to_str().map(ToString::to_string))
-        .collect();
-    names.sort();
-    names.dedup();
-    names
-}
-
 fn is_agent_pane(child_names: &[String]) -> bool {
     child_names
         .iter()
@@ -350,10 +317,9 @@ fn is_agent_pane(child_names: &[String]) -> bool {
 }
 
 /// Find a pane in the same session that is running an agent.
-pub async fn find_other_pane(my_pane_id: &str) -> Result<Pane> {
-    use sysinfo::{ProcessesToUpdate, System};
-
-    let panes = list_panes(my_pane_id).await?;
+async fn find_peer_in_same_session(my_pane_id: &str) -> Result<TmuxPaneInfo> {
+    let session_name = session_for_pane(my_pane_id).await?;
+    let panes = list_panes_in_session(&session_name).await?;
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
 
@@ -365,7 +331,7 @@ pub async fn find_other_pane(my_pane_id: &str) -> Result<Pane> {
             continue;
         }
         other_panes += 1;
-        let child_names = child_process_names(&sys, &pane);
+        let child_names = child_process_names(&sys, pane.pid);
         if is_agent_pane(&child_names) {
             return Ok(pane);
         }
@@ -393,6 +359,19 @@ pub async fn find_other_pane(my_pane_id: &str) -> Result<Pane> {
         "no claude or codex pane found in {other_panes} other panes:\n{}\nIs your mate running?",
         details.join("\n")
     ))
+}
+
+fn child_process_names(sys: &System, pid: u32) -> Vec<String> {
+    let parent = Pid::from_u32(pid);
+    let mut names: Vec<String> = sys
+        .processes()
+        .values()
+        .filter(|proc| proc.parent() == Some(parent))
+        .filter_map(|proc| proc.name().to_str().map(ToString::to_string))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 #[cfg(test)]
