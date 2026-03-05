@@ -90,6 +90,22 @@ impl crate::protocol::Coop for CoopServer {
             std::process::exit(0);
         }
 
+        let existing_request_id = {
+            let reqs = self.requests.lock().await;
+            reqs.iter().find_map(|(key, request)| {
+                if request.session_name == req.session_name {
+                    Some(key.rsplit('/').next().unwrap_or(key.as_str()).to_string())
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(existing_id) = existing_request_id {
+            return Err(format!(
+                "Your mate already has an active task (ID: {existing_id}). Wait until it finishes before assigning another."
+            ));
+        }
+
         let crate::protocol::AssignRequest {
             source_pane,
             session_name,
