@@ -1,3 +1,4 @@
+use crate::pane;
 use eyre::Result;
 use rand::prelude::IndexedRandom;
 
@@ -31,6 +32,35 @@ pub struct Pane {
     pub id: String,
     pub pid: u32,
     pub session_name: String,
+}
+
+pub struct TmuxPane {
+    id: crate::pane::PaneId,
+}
+
+impl TmuxPane {
+    pub fn new(id: crate::pane::PaneId) -> Self {
+        Self { id }
+    }
+}
+
+#[async_trait::async_trait]
+impl pane::Pane for TmuxPane {
+    async fn slash_command(&self, command: &str) -> Result<()> {
+        if !is_slash_command(command) {
+            return Err(eyre::eyre!("invalid slash command"));
+        }
+        send_to_pane_exact(self.id.0.as_str(), command).await
+    }
+
+    async fn chat_message(&self, message: &str) -> Result<()> {
+        send_to_pane(self.id.0.as_str(), message).await
+    }
+
+    async fn snapshot(&self) -> Result<pane::PaneState> {
+        let capture = capture_pane(self.id.0.as_str()).await?;
+        Ok(pane::parse_pane_content(&capture))
+    }
 }
 
 /// List tmux panes in the same session as the given pane.
@@ -141,18 +171,18 @@ async fn wait_for_paste(pane_id: &str, marker: &str) -> Result<()> {
     Ok(())
 }
 
-/// Send text to a tmux pane. Uses a unique emoji marker for paste detection,
-/// waits for paste confirmation, then submits with C-m.
-pub async fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
-    let threemoji = gen_threemoji();
-    let tagged = prepare_outgoing_text(text, &threemoji);
-    // marker to wait for before submitting
-    let marker = if is_slash_command(text) {
-        text
-    } else {
-        threemoji.as_str()
-    };
+async fn wait_for_exact_text(pane_id: &str, text: &str) -> Result<()> {
+    for _ in 0..100 {
+        let content = capture_pane(pane_id).await?;
+        if content.contains(text) {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
 
+async fn send_to_pane_exact(pane_id: &str, text: &str) -> Result<()> {
     // Silently exit copy mode if active (no-op if not in copy mode)
     let _ = tokio::process::Command::new("tmux")
         .args(["copy-mode", "-q", "-t", pane_id])
@@ -173,7 +203,67 @@ pub async fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let status = tokio::process::Command::new("tmux")
-        .args(["send-keys", "-t", pane_id, "-l", &tagged])
+        .args(["send-keys", "-t", pane_id, "-l", text])
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(eyre::eyre!(
+            "tmux send-keys (text) failed for pane {pane_id}"
+        ));
+    }
+
+    wait_for_exact_text(pane_id, text).await?;
+
+    let status = tokio::process::Command::new("tmux")
+        .args(["send-keys", "-t", pane_id, "C-m"])
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(eyre::eyre!(
+            "tmux send-keys (C-m) failed for pane {pane_id}"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Send text to a tmux pane. Uses a unique emoji marker for paste detection,
+/// waits for paste confirmation, then submits with C-m.
+pub async fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
+    let threemoji = gen_threemoji();
+    let tagged = prepare_outgoing_text(text, &threemoji);
+    // marker to wait for before submitting
+    let marker = if is_slash_command(text) {
+        text
+    } else {
+        threemoji.as_str()
+    };
+
+    send_to_pane_with_marker(pane_id, &tagged, marker).await
+}
+
+async fn send_to_pane_with_marker(pane_id: &str, text: &str, marker: &str) -> Result<()> {
+    // Silently exit copy mode if active (no-op if not in copy mode)
+    let _ = tokio::process::Command::new("tmux")
+        .args(["copy-mode", "-q", "-t", pane_id])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+
+    // Clear any existing input (C-u kills the line without interrupting the process)
+    let status = tokio::process::Command::new("tmux")
+        .args(["send-keys", "-t", pane_id, "C-u"])
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(eyre::eyre!(
+            "tmux send-keys (C-u) failed for pane {pane_id}"
+        ));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let status = tokio::process::Command::new("tmux")
+        .args(["send-keys", "-t", pane_id, "-l", text])
         .status()
         .await?;
     if !status.success() {
