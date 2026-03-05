@@ -35,6 +35,8 @@ struct Waiter {
 struct PaneState {
     last_content: String,
     unchanged_count: u32,
+    captain_last_content: String,
+    captain_unchanged_count: u32,
     notified: bool,
     idle_since: Option<Instant>,
     idle_nudged: bool,
@@ -764,6 +766,8 @@ async fn run_staleness_checks(
             let state = pane_states.entry(key).or_insert_with(|| PaneState {
                 last_content: pane_content.clone(),
                 unchanged_count: 0,
+                captain_last_content: String::new(),
+                captain_unchanged_count: 0,
                 notified: false,
                 idle_since: None,
                 idle_nudged: false,
@@ -814,7 +818,29 @@ async fn run_staleness_checks(
                 state.notified = false;
             }
 
-            if state.notified || state.unchanged_count < STALENESS_NOTIFY_AFTER_UNCHANGED {
+            let captain_pane_content = match tmux::capture_pane(&meta.source_pane) {
+                Ok(content) => content,
+                Err(e) => {
+                    error!(
+                        "failed to capture captain pane {} for request {}: {e}",
+                        meta.source_pane, request_id
+                    );
+                    continue;
+                }
+            };
+
+            if captain_pane_content == state.captain_last_content {
+                state.captain_unchanged_count += 1;
+            } else {
+                state.captain_last_content = captain_pane_content;
+                state.captain_unchanged_count = 0;
+                state.notified = false;
+            }
+
+            if state.notified
+                || state.unchanged_count < STALENESS_NOTIFY_AFTER_UNCHANGED
+                || state.captain_unchanged_count < STALENESS_NOTIFY_AFTER_UNCHANGED
+            {
                 continue;
             }
 
@@ -824,7 +850,7 @@ async fn run_staleness_checks(
                 .map(|title| format!(" ({title})"))
                 .unwrap_or_default();
             let message = format!(
-                "⏰ Hey captain — your mate seems stuck on task {request_id}{title_suffix}. Their pane has been unchanged for 2 minutes.\n\nPane content:\n```\n{pane_content}\n```"
+                "⏰ Hey captain — your mate seems stuck on task {request_id}{title_suffix}. Both panes have been unchanged for 2 minutes.\n\nMate pane content:\n```\n{pane_content}\n```"
             );
             if let Err(e) = tmux::send_to_pane(&meta.source_pane, &message) {
                 error!(
