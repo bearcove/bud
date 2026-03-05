@@ -195,38 +195,6 @@ pub fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prepare_outgoing_text_appends_marker_for_regular_text() {
-        let marker = "🦊🪐🧿";
-        assert_eq!(
-            prepare_outgoing_text("hello world", marker),
-            "hello world 🦊🪐🧿"
-        );
-    }
-
-    #[test]
-    fn prepare_outgoing_text_appends_marker_for_multiline_text() {
-        let marker = "🦊🪐🧿";
-        assert_eq!(
-            prepare_outgoing_text("line1\nline2", marker),
-            "line1\nline2 🦊🪐🧿"
-        );
-    }
-
-    #[test]
-    fn prepare_outgoing_text_skips_markers_for_slash_commands() {
-        let marker = "🦊🪐🧿";
-        assert!(is_slash_command("   /clear"));
-        assert!(is_slash_command("/status now"));
-        assert_eq!(prepare_outgoing_text("   /clear", marker), "   /clear");
-        assert_eq!(prepare_outgoing_text("/status now", marker), "/status now");
-    }
-}
-
 fn child_process_names(sys: &sysinfo::System, pane: &Pane) -> Vec<String> {
     use sysinfo::Pid;
 
@@ -292,4 +260,36 @@ pub fn find_other_pane(my_pane_id: &str) -> Result<Pane> {
         "no claude or codex pane found in {other_panes} other panes:\n{}\nIs your mate running?",
         details.join("\n")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_outgoing_text_appends_marker_for_regular_text() {
+        let marker = "🦊🪐🧿";
+        assert_eq!(
+            prepare_outgoing_text("hello world", marker),
+            "hello world 🦊🪐🧿"
+        );
+    }
+
+    #[test]
+    fn prepare_outgoing_text_appends_marker_for_multiline_text() {
+        let marker = "🦊🪐🧿";
+        assert_eq!(
+            prepare_outgoing_text("line1\nline2", marker),
+            "line1\nline2 🦊🪐🧿"
+        );
+    }
+
+    #[test]
+    fn prepare_outgoing_text_skips_markers_for_slash_commands() {
+        let marker = "🦊🪐🧿";
+        assert!(is_slash_command("   /clear"));
+        assert!(is_slash_command("/status now"));
+        assert_eq!(prepare_outgoing_text("   /clear", marker), "   /clear");
+        assert_eq!(prepare_outgoing_text("/status now", marker), "/status now");
+    }
 }

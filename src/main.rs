@@ -450,15 +450,14 @@ async fn ensure_server_running() -> Result<()> {
     let pid_file = pid_path();
     if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
         && let Ok(pid) = pid_str.trim().parse::<u32>()
+        && pid_is_alive(pid)
     {
-        if pid_is_alive(pid) {
-            // Server may be in the middle of startup; wait briefly for the socket to accept.
-            for _ in 0..10 {
-                if socket_accepts_connections(&socket).await {
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Server may be in the middle of startup; wait briefly for the socket to accept.
+        for _ in 0..10 {
+            if socket_accepts_connections(&socket).await {
+                return Ok(());
             }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
@@ -1857,7 +1856,7 @@ fn process_pending_issue_drafts(
             );
             continue;
         }
-        if !raw_path.extension().is_some_and(|ext| ext == "md") {
+        if raw_path.extension().is_none_or(|ext| ext != "md") {
             trace!(
                 "process_pending_issue_drafts: filtered non-md {}",
                 raw_path.display()
