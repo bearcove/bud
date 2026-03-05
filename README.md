@@ -27,7 +27,7 @@ to each other and receive results back — without either agent knowing about tm
 
 1. Captain pipes a task to `mate assign` via stdin
 2. The server pastes the task directly into the mate's tmux pane
-3. The mate does the work, then pipes their response to `mate respond <id>`
+3. The mate does the work, then pipes their response to `mate update <id>`
 4. The server detects the response file and delivers it back to the captain's pane
 
 Agents never deal with tmux, pane IDs, or polling. They just assign tasks and
@@ -51,7 +51,8 @@ cat <<'EOF' | mate assign                 Assign a task (clears mate context)
 cat <<'EOF' | mate assign --keep          Assign, keeping mate's context
 cat <<'EOF' | mate assign --title "..."   Assign with an optional title
 cat <<'EOF' | mate assign --issue 42      Assign with GitHub issue context
-cat <<'EOF' | mate respond <id>           Respond to a task (mates use this)
+cat <<'EOF' | mate update <id>            Send progress update or final response (mates use this)
+cat <<'EOF' | mate respond <id>           Internal/backward-compatible response command
 ```
 
 ### Mate issues workflow
@@ -82,10 +83,13 @@ binary changes (no manual restart needed after `cargo install`).
 
 ## Paste detection
 
-Each message is prepended with a random 3-emoji marker (e.g. `🦊🪐🧿`).
-After pasting, mate polls the pane for either the emoji marker (small pastes)
-or the `[Pasted text ` indicator (large pastes). This ensures the paste has
-landed before submitting with Enter.
+Mate uses a random 3-emoji marker (e.g. `🦊🪐🧿`) for paste detection.
+Short messages keep the marker at the beginning; long or multi-line pastes put
+the marker at the end so it stays visible in pane history. Slash commands
+(`/<command>`) skip markers entirely.
+After pasting, mate polls the pane for either the emoji marker or the
+`[Pasted text ` indicator. This ensures the paste has landed before submitting
+with Enter.
 
 ## Agent detection
 

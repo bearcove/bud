@@ -14,7 +14,6 @@ use facet::Facet;
 use figue as args;
 use std::io::Read as _;
 use std::path::PathBuf;
-use std::time::Duration;
 use tracing::trace;
 
 #[derive(Facet, Debug)]
@@ -152,10 +151,6 @@ fn response_dir(session_name: &str) -> PathBuf {
     response_root_dir().join(session_name)
 }
 
-fn waiter_marker_path(session_name: &str, request_id: &str) -> PathBuf {
-    response_dir(session_name).join(format!("{request_id}.waiter"))
-}
-
 fn request_root_dir() -> PathBuf {
     PathBuf::from("/tmp/mate-requests")
 }
@@ -166,10 +161,6 @@ fn request_dir(session_name: &str) -> PathBuf {
 
 fn idle_tracking_root_dir() -> PathBuf {
     PathBuf::from("/tmp/mate-idle")
-}
-
-fn orphaned_dir() -> PathBuf {
-    PathBuf::from("/tmp/mate-orphaned")
 }
 
 fn log_path() -> PathBuf {
@@ -238,7 +229,7 @@ async fn main() -> Result<()> {
         Some(Command::Spy { request_id }) => spy_request(&request_id),
         Some(Command::Steer { request_id }) => steer_request(&request_id),
         Some(Command::Accept { request_id }) => accept_request(&request_id),
-        Some(Command::Update { request_id }) => update_request(&request_id),
+        Some(Command::Update { request_id }) => update_request(&request_id).await,
         Some(Command::Issues) => sync_issues_to_pane(),
         Some(Command::Assign { keep, title, issue }) => {
             let pane = std::env::var("TMUX_PANE")
@@ -252,29 +243,15 @@ async fn main() -> Result<()> {
             validate_request_id(&request_id)?;
             let content = read_stdin()?;
             let session_name = tmux_session_name()?;
-            let request_path = request_dir(&session_name).join(&request_id);
-            if !request_path.exists() {
-                std::fs::create_dir_all(orphaned_dir())?;
-                let orphaned_path = orphaned_dir().join(format!("{request_id}.md"));
-                std::fs::write(&orphaned_path, &content)?;
-                eprintln!("No matching request found for {request_id} in session {session_name}.");
-                eprintln!("Response saved to: {}", orphaned_path.display());
-                eprintln!("Ask the user what to do with it.");
-                return Ok(());
-            }
-            // Write the response file directly — no RPC needed
-            std::fs::create_dir_all(response_dir(&session_name))?;
-            let path = response_dir(&session_name).join(format!("{request_id}.md"));
-            std::fs::write(&path, &content)?;
-            eprintln!("{}", warmth::responded());
-            Ok(())
+            ensure_server_running().await?;
+            rpc_respond(&request_id, &session_name, &content).await
         }
         Some(Command::Wait {
             request_id,
             timeout,
         }) => {
             let timeout_secs = timeout.unwrap_or(90);
-            wait_for_response(&request_id, timeout_secs)
+            wait_for_response(&request_id, timeout_secs).await
         }
     }
 }
@@ -489,53 +466,47 @@ fn accept_request(request_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn update_request(request_id: &str) -> Result<()> {
+async fn rpc_respond(request_id: &str, session_name: &str, content: &str) -> Result<()> {
+    use roam_stream::StreamLink;
+    let stream = tokio::net::UnixStream::connect(socket_path())
+        .await
+        .map_err(|e| eyre::eyre!("failed to connect to mate server: {e}"))?;
+    let (client, _sh) = roam::initiator(StreamLink::unix(stream))
+        .establish::<protocol::CoopClient>(())
+        .await?;
+    client
+        .respond(protocol::RespondRequest {
+            request_id: request_id.to_string(),
+            session_name: session_name.to_string(),
+            content: content.to_string(),
+        })
+        .await
+        .map_err(|e| eyre::eyre!("{e:?}"))?;
+    eprintln!("{}", warmth::responded());
+    Ok(())
+}
+
+async fn update_request(request_id: &str) -> Result<()> {
     validate_request_id(request_id)?;
-    let message = read_stdin()?;
+    let content = read_stdin()?;
     let session_name = tmux_session_name()?;
-    let path = request_dir(&session_name).join(request_id);
-    let meta = util::read_request_meta(&path)
-        .ok_or_else(|| eyre::eyre!("No task with ID {request_id} found."))?;
-    let title_suffix = meta
-        .title
-        .as_deref()
-        .map(|title| format!(" ({title})"))
-        .unwrap_or_default();
-    let git_status = std::process::Command::new("git")
-        .args(["status", "--short"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    let git_section = if git_status.is_empty() {
-        String::new()
-    } else {
-        format!("\n\ngit status:\n```\n{git_status}\n```")
-    };
-    let update = format!(
-        "📋 Progress update from your mate on task {request_id}{title_suffix}:\n\n{message}\n\nWhether you're happy or unhappy with this update, reply to your mate (not the user!) with:\n\ncat <<'MATEEOF' | mate steer {request_id}\n<your reply here>\nMATEEOF\n\nIf the work looks good, accept the task:\nmate accept {request_id}\n\nThis is also a good time to commit and push your mate's work so far.{git_section}"
-    );
-    let waiter_marker = waiter_marker_path(&session_name, request_id);
-    if waiter_marker.exists() {
-        std::fs::create_dir_all(response_dir(&session_name))?;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis();
-        let update_path =
-            response_dir(&session_name).join(format!("{request_id}.update.{timestamp}.md"));
-        std::fs::write(&update_path, &update)?;
-        eprintln!(
-            "Queued progress update for task {request_id} at {}.",
-            update_path.display()
-        );
-    } else {
-        tmux::send_to_pane(&meta.source_pane, &update)?;
-        eprintln!(
-            "Sent progress update for task {request_id} to pane {}.",
-            meta.source_pane
-        );
-    }
+    ensure_server_running().await?;
+    use roam_stream::StreamLink;
+    let stream = tokio::net::UnixStream::connect(socket_path())
+        .await
+        .map_err(|e| eyre::eyre!("failed to connect to mate server: {e}"))?;
+    let (client, _sh) = roam::initiator(StreamLink::unix(stream))
+        .establish::<protocol::CoopClient>(())
+        .await?;
+    client
+        .update(protocol::UpdateRequest {
+            request_id: request_id.to_string(),
+            session_name,
+            content,
+        })
+        .await
+        .map_err(|e| eyre::eyre!("{e:?}"))?;
+    eprintln!("Update sent for task {request_id}.");
     Ok(())
 }
 
@@ -546,9 +517,7 @@ fn format_captain_update_for_buddy(request_id: &str, message: &str) -> String {
          If you hit a decision point, want to share progress, or need clarification, send an update:\n\n\
          cat <<'MATEEOF' | mate update {request_id}\n\
          <your progress update here>\n\
-         MATEEOF\n\n\
-         If the work looks good, accept the task:\n\
-         mate accept {request_id}"
+         MATEEOF"
     )
 }
 
@@ -570,7 +539,7 @@ mod tests {
 
         assert!(update.contains("📌 Update from the captain on task deadbeef:"));
         assert!(update.contains("cat <<'MATEEOF' | mate update deadbeef"));
-        assert!(update.contains("mate accept deadbeef"));
+        assert!(!update.contains("mate accept deadbeef"));
         assert!(update.contains("<your progress update here>"));
         assert!(!update.contains("<your reply here>"));
         assert!(!update.contains("mate respond deadbeef"));
@@ -774,7 +743,7 @@ mod tests {
     fn claude_tokens_context_normalizes_to_percent_line() {
         assert_eq!(
             format_context_line("73740 tokens"),
-            "Context: 73740 tokens -> 36% left [####------]"
+            "Context: 73740 tokens -> 64% left [######----]"
         );
     }
 
@@ -1070,8 +1039,8 @@ fn parse_context_percent_left(context: &str) -> Option<u64> {
     if let Some(tokens_str) = trimmed.strip_suffix(" tokens")
         && let Ok(tokens) = tokens_str.trim().parse::<u64>()
     {
-        let percent = tokens.saturating_mul(100) / 200_000;
-        return Some(percent.min(100));
+        let percent_used = tokens.saturating_mul(100) / 200_000;
+        return Some(100u64.saturating_sub(percent_used));
     }
     None
 }
@@ -1470,149 +1439,102 @@ fn sync_issues_to_pane() -> Result<()> {
     Ok(())
 }
 
-fn wait_for_response(request_id: &str, timeout_secs: u64) -> Result<()> {
+async fn wait_for_response(request_id: &str, timeout_secs: u64) -> Result<()> {
     validate_request_id(request_id)?;
     let session_name = tmux_session_name()?;
     let request_path = request_dir(&session_name).join(request_id);
-    let request_meta = request_path.join("meta");
-    if !request_meta.is_file() {
+    if !request_path.join("meta").is_file() {
         return Err(eyre::eyre!(
             "No matching request found for {request_id} in session {session_name}."
         ));
     }
 
-    let response_path = response_dir(&session_name).join(format!("{request_id}.md"));
-    let final_path = response_dir(&session_name).join(format!("{request_id}.final.md"));
-    let update_prefix = format!("{request_id}.update.");
-    let poll_interval = Duration::from_secs(2);
-    let mut waited = 0u64;
-    let mut next_progress = 10u64;
     let buddy_pane = util::read_request_meta(&request_path)
         .map(|meta| meta.target_pane)
         .unwrap_or_default();
-    let mut seen_updates: std::collections::HashSet<String> = std::collections::HashSet::new();
-    std::fs::create_dir_all(response_dir(&session_name))?;
-    let waiter_marker = waiter_marker_path(&session_name, request_id);
-    std::fs::write(&waiter_marker, std::process::id().to_string())?;
 
-    struct WaiterMarkerGuard {
-        path: std::path::PathBuf,
-    }
-    impl Drop for WaiterMarkerGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-    let _waiter_guard = WaiterMarkerGuard {
-        path: waiter_marker.clone(),
-    };
-
-    if final_path.exists() {
-        let response = std::fs::read_to_string(&final_path)?;
-        eprintln!("{response}");
-        let _ = std::fs::remove_file(&final_path);
-        return Ok(());
-    }
-    if !request_path.exists() {
-        eprintln!("Response for {request_id} has been delivered.");
-        return Ok(());
-    }
+    ensure_server_running().await?;
 
     eprintln!("Waiting for response on {request_id} for up to {timeout_secs}s...");
 
-    while waited < timeout_secs {
-        std::thread::sleep(poll_interval);
-        waited += 2;
-        let _ = std::fs::write(&waiter_marker, waited.to_string());
+    use roam_stream::StreamLink;
+    let stream = tokio::net::UnixStream::connect(socket_path())
+        .await
+        .map_err(|e| eyre::eyre!("failed to connect to mate server: {e}"))?;
+    let (client, _sh) = roam::initiator(StreamLink::unix(stream))
+        .establish::<protocol::CoopClient>(())
+        .await?;
 
-        if let Ok(entries) = std::fs::read_dir(response_dir(&session_name)) {
-            let mut updates: Vec<(String, std::path::PathBuf)> = entries
-                .flatten()
-                .filter_map(|entry| {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if !name.starts_with(&update_prefix) || !name.ends_with(".md") {
-                        return None;
-                    }
-                    Some((name, entry.path()))
-                })
-                .collect();
-            updates.sort_by(|a, b| a.0.cmp(&b.0));
-            for (name, update_file) in updates {
-                if seen_updates.contains(&name) {
-                    continue;
-                }
-                match std::fs::read_to_string(&update_file) {
-                    Ok(update) => {
-                        eprintln!("{update}");
-                        seen_updates.insert(name);
-                        let _ = std::fs::remove_file(&update_file);
-                    }
-                    Err(_) => {
-                        seen_updates.insert(name);
-                    }
-                }
+    let start = tokio::time::Instant::now();
+    let mut next_progress_secs = 10u64;
+    // Each RPC wait call blocks for up to 30s server-side.
+    let rpc_timeout_secs = 30u64;
+
+    loop {
+        let elapsed_secs = start.elapsed().as_secs();
+        if elapsed_secs >= timeout_secs {
+            return Err(eyre::eyre!(
+                "Timed out waiting for response on {request_id} after {timeout_secs}s"
+            ));
+        }
+        let remaining = timeout_secs - elapsed_secs;
+        let this_timeout = rpc_timeout_secs.min(remaining);
+
+        let event = client
+            .wait(protocol::WaitRequest {
+                request_id: request_id.to_string(),
+                session_name: session_name.clone(),
+                timeout_secs: this_timeout,
+            })
+            .await
+            .map_err(|e| eyre::eyre!("{e:?}"))?;
+
+        match event {
+            protocol::WaitEvent::Update { message } => {
+                eprintln!("{message}");
             }
-        }
-
-        if final_path.exists() {
-            let response = std::fs::read_to_string(&final_path)?;
-            eprintln!("{response}");
-            let _ = std::fs::remove_file(&final_path);
-            return Ok(());
-        }
-        if !request_path.exists() {
-            if final_path.exists() {
-                let response = std::fs::read_to_string(&final_path)?;
-                eprintln!("{response}");
-                let _ = std::fs::remove_file(&final_path);
+            protocol::WaitEvent::Response { message } => {
+                eprintln!("{message}");
                 return Ok(());
             }
-            if response_path.exists() {
-                let response = std::fs::read_to_string(&response_path)?;
-                eprintln!("{response}");
-                return Ok(());
-            }
-            eprintln!("Response for {request_id} has been delivered.");
-            return Ok(());
-        }
-
-        if waited >= next_progress {
-            let status_suffix = if buddy_pane.is_empty() {
-                String::new()
-            } else {
-                let capture = tmux::capture_pane(&buddy_pane).unwrap_or_default();
-                let parsed = pane::parse_pane_content(&capture);
-                if let Some(agent_type) = parsed.agent_type {
-                    let agent = match agent_type {
-                        pane::AgentType::Claude => "Claude",
-                        pane::AgentType::Codex => "Codex",
-                    };
-                    let state = match parsed.state {
-                        pane::AgentState::Working => "Working",
-                        pane::AgentState::Idle => "Idle",
-                        pane::AgentState::Unknown => "Unknown",
-                    };
-                    let context = parsed.context_remaining.unwrap_or_else(|| "-".to_string());
-                    let mut suffix = format!(" · {agent} · {state} · {context}");
-                    if let Some(activity) = parsed.activity {
-                        let activity = activity.replace('\n', " ");
-                        if !activity.trim().is_empty() {
-                            suffix.push_str(&format!(" · {activity}"));
+            protocol::WaitEvent::Timeout => {
+                let elapsed_secs = start.elapsed().as_secs();
+                if elapsed_secs >= next_progress_secs {
+                    let status_suffix = if buddy_pane.is_empty() {
+                        String::new()
+                    } else {
+                        let capture = tmux::capture_pane(&buddy_pane).unwrap_or_default();
+                        let parsed = pane::parse_pane_content(&capture);
+                        if let Some(agent_type) = parsed.agent_type {
+                            let agent = match agent_type {
+                                pane::AgentType::Claude => "Claude",
+                                pane::AgentType::Codex => "Codex",
+                            };
+                            let state = match parsed.state {
+                                pane::AgentState::Working => "Working",
+                                pane::AgentState::Idle => "Idle",
+                                pane::AgentState::Unknown => "Unknown",
+                            };
+                            let context =
+                                parsed.context_remaining.unwrap_or_else(|| "-".to_string());
+                            let mut suffix = format!(" · {agent} · {state} · {context}");
+                            if let Some(activity) = parsed.activity {
+                                let activity = activity.replace('\n', " ");
+                                if !activity.trim().is_empty() {
+                                    suffix.push_str(&format!(" · {activity}"));
+                                }
+                            }
+                            suffix
+                        } else {
+                            " · Unknown".to_string()
                         }
-                    }
-                    suffix
-                } else {
-                    " · Unknown".to_string()
+                    };
+                    eprintln!("Waiting for response... ({elapsed_secs}s){status_suffix}");
+                    next_progress_secs += 10;
                 }
-            };
-            eprintln!("Waiting for response... ({waited}s){status_suffix}");
-            next_progress += 10;
+            }
         }
     }
-
-    Err(eyre::eyre!(
-        "Timed out waiting for response on {request_id} after {timeout_secs}s"
-    ))
 }
 
 struct PendingIssueCreated {

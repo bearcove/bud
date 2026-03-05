@@ -25,6 +25,13 @@ struct Request {
     title: Option<String>,
 }
 
+/// Registered when `mate wait` is blocking server-side for a request.
+struct Waiter {
+    /// The event to deliver once available (set by respond/update handlers).
+    event: Option<crate::protocol::WaitEvent>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
 struct PaneState {
     last_content: String,
     unchanged_count: u32,
@@ -48,6 +55,8 @@ struct CoopServer {
     requests: Arc<Mutex<HashMap<String, Request>>>,
     request_root_dir: PathBuf,
     idle_states: Arc<Mutex<HashMap<String, IdleState>>>,
+    /// Active waiters registered by `mate wait` RPC calls. Keyed by request_key.
+    waiters: Arc<Mutex<HashMap<String, Waiter>>>,
 }
 
 fn request_key(session_name: &str, request_id: &str) -> String {
@@ -177,6 +186,178 @@ impl crate::protocol::Coop for CoopServer {
         );
         Ok(request_id)
     }
+
+    async fn respond(
+        &self,
+        req: crate::protocol::RespondRequest,
+    ) -> Result<(), String> {
+        let crate::protocol::RespondRequest {
+            request_id,
+            session_name,
+            content,
+        } = req;
+        let request_key = request_key(&session_name, &request_id);
+
+        let (source_pane, title) = {
+            let reqs = self.requests.lock().await;
+            if let Some(r) = reqs.get(&request_key) {
+                (r.source_pane.clone(), r.title.clone())
+            } else {
+                let path = self.request_root_dir.join(&session_name).join(&request_id);
+                match crate::util::read_request_meta(&path) {
+                    Some(meta) => (meta.source_pane, meta.title),
+                    None => return Err(format!("no request found for {request_key}")),
+                }
+            }
+        };
+
+        let intro = if let Some(t) = title.as_deref() {
+            format!("Fresh from your mate — re: {t}")
+        } else {
+            crate::warmth::delivered().to_string()
+        };
+        let (git_section, show_commit_reminder) = crate::util::git_commit_reminder();
+        let commit_reminder = if show_commit_reminder {
+            "\n\nThis is also a good time to commit and push your mate's work so far."
+        } else {
+            ""
+        };
+        let message = format!(
+            "{intro}\n{content}\n\nRemember: you're the captain. If there's follow-up work, assign it to your mate — don't do it yourself. Stay focused on the big picture!{commit_reminder}{git_section}"
+        );
+
+        // Deliver to waiter if present, otherwise via tmux directly.
+        // Request state is NOT cleaned up here — only `mate accept` does that.
+        let waiter_notify = {
+            let mut waiters = self.waiters.lock().await;
+            if let Some(w) = waiters.get_mut(&request_key) {
+                w.event = Some(crate::protocol::WaitEvent::Response {
+                    message: message.clone(),
+                });
+                Some(w.notify.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(notify) = waiter_notify {
+            notify.notify_one();
+        } else if let Err(e) = tmux::send_to_pane(&source_pane, &message) {
+            return Err(format!("failed to deliver response: {e}"));
+        }
+
+        info!("delivered response for request {request_id} in session {session_name} via RPC");
+        Ok(())
+    }
+
+    async fn update(
+        &self,
+        req: crate::protocol::UpdateRequest,
+    ) -> Result<(), String> {
+        let crate::protocol::UpdateRequest {
+            request_id,
+            session_name,
+            content,
+        } = req;
+        let request_key = request_key(&session_name, &request_id);
+
+        let (source_pane, title) = {
+            let reqs = self.requests.lock().await;
+            if let Some(r) = reqs.get(&request_key) {
+                (r.source_pane.clone(), r.title.clone())
+            } else {
+                let path = self.request_root_dir.join(&session_name).join(&request_id);
+                match crate::util::read_request_meta(&path) {
+                    Some(meta) => (meta.source_pane, meta.title),
+                    None => return Err(format!("no request found for {request_key}")),
+                }
+            }
+        };
+
+        let title_suffix = title
+            .as_deref()
+            .map(|t| format!(" ({t})"))
+            .unwrap_or_default();
+        let (git_section, show_commit_reminder) = crate::util::git_commit_reminder();
+        let commit_reminder = if show_commit_reminder {
+            "\n\nThis is also a good time to commit and push your mate's work so far."
+        } else {
+            ""
+        };
+        let message = format!(
+            "📋 Progress update from your mate on task {request_id}{title_suffix}:\n\n{content}\n\nWhether you're happy or unhappy with this update, reply to your mate (not the user!) with:\n\ncat <<'MATEEOF' | mate steer {request_id}\n<your reply here>\nMATEEOF\n\nIf the work looks good, accept the task:\nmate accept {request_id}{commit_reminder}{git_section}"
+        );
+
+        // Deliver to waiter if present, otherwise via tmux directly.
+        let waiter_notify = {
+            let mut waiters = self.waiters.lock().await;
+            if let Some(w) = waiters.get_mut(&request_key) {
+                w.event = Some(crate::protocol::WaitEvent::Update {
+                    message: message.clone(),
+                });
+                Some(w.notify.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(notify) = waiter_notify {
+            notify.notify_one();
+        } else if let Err(e) = tmux::send_to_pane(&source_pane, &message) {
+            return Err(format!("failed to deliver update: {e}"));
+        }
+
+        Ok(())
+    }
+
+    async fn wait(
+        &self,
+        req: crate::protocol::WaitRequest,
+    ) -> Result<crate::protocol::WaitEvent, String> {
+        let crate::protocol::WaitRequest {
+            request_id,
+            session_name,
+            timeout_secs,
+        } = req;
+        let request_key = request_key(&session_name, &request_id);
+
+        // If request no longer exists, the response was already delivered.
+        let exists = {
+            let reqs = self.requests.lock().await;
+            let path = self.request_root_dir.join(&session_name).join(&request_id);
+            reqs.contains_key(&request_key) || path.exists()
+        };
+        if !exists {
+            return Ok(crate::protocol::WaitEvent::Response {
+                message: "(response already delivered to your pane)".to_string(),
+            });
+        }
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut waiters = self.waiters.lock().await;
+            waiters.insert(
+                request_key.clone(),
+                Waiter {
+                    event: None,
+                    notify: notify.clone(),
+                },
+            );
+        }
+
+        let timeout = tokio::time::Duration::from_secs(timeout_secs);
+        let _ = tokio::time::timeout(timeout, notify.notified()).await;
+
+        let event = {
+            let mut waiters = self.waiters.lock().await;
+            waiters
+                .remove(&request_key)
+                .and_then(|w| w.event)
+                .unwrap_or(crate::protocol::WaitEvent::Timeout)
+        };
+
+        Ok(event)
+    }
 }
 
 pub async fn run_server(
@@ -209,6 +390,7 @@ pub async fn run_server(
     let listener = UnixListener::bind(&socket_path)?;
     let requests: Arc<Mutex<HashMap<String, Request>>> = Arc::new(Mutex::new(HashMap::new()));
     let idle_states: Arc<Mutex<HashMap<String, IdleState>>> = Arc::new(Mutex::new(HashMap::new()));
+    let waiters: Arc<Mutex<HashMap<String, Waiter>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let watch_requests = requests.clone();
     let watch_idle_states = idle_states.clone();
@@ -229,11 +411,13 @@ pub async fn run_server(
         let reqs = requests.clone();
         let server_request_root = request_root_dir.clone();
         let server_idle_states = idle_states.clone();
+        let server_waiters = waiters.clone();
         tokio::spawn(async move {
             let server = CoopServer {
                 requests: reqs,
                 request_root_dir: server_request_root,
                 idle_states: server_idle_states,
+                waiters: server_waiters,
             };
             let result = roam::acceptor(StreamLink::unix(stream))
                 .establish::<CoopClient>(CoopDispatcher::new(server))
@@ -700,7 +884,10 @@ async fn process_response_files(
             let Some(filename) = response_path.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if filename.contains(".update.") || filename.contains(".final.") {
+            if filename.contains(".update.")
+                || filename.contains(".final.")
+                || filename.ends_with(".waiter")
+            {
                 continue;
             }
 
@@ -768,20 +955,14 @@ async fn process_response_files(
             } else {
                 crate::warmth::delivered().to_string()
             };
-            let git_status = std::process::Command::new("git")
-                .args(["status", "--short"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
-            let git_section = if git_status.is_empty() {
-                String::new()
+            let (git_section, show_commit_reminder) = crate::util::git_commit_reminder();
+            let commit_reminder = if show_commit_reminder {
+                "\n\nThis is also a good time to commit and push your mate's work so far."
             } else {
-                format!("\n\ngit status:\n```\n{git_status}\n```")
+                ""
             };
             let message = format!(
-                "{intro}\n{body}\n\nRemember: you're the captain. If there's follow-up work, assign it to your mate — don't do it yourself. Stay focused on the big picture!\n\nThis is also a good time to commit and push your mate's work so far.{git_section}"
+                "{intro}\n{body}\n\nRemember: you're the captain. If there's follow-up work, assign it to your mate — don't do it yourself. Stay focused on the big picture!{commit_reminder}{git_section}"
             );
             let waiter_marker = session_path.join(format!("{request_id}.waiter"));
             if waiter_marker.exists() {

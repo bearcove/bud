@@ -119,3 +119,54 @@ pub fn read_request_meta(dir: &Path) -> Option<RequestMeta> {
 pub fn read_request_content(dir: &Path) -> Option<String> {
     std::fs::read_to_string(dir.join("content")).ok()
 }
+
+/// Returns (git_section, show_commit_reminder).
+///
+/// - If not in a git repo (git fails entirely), returns ("", false).
+/// - git_section is a non-empty "\n\ngit status:\n```\n...\n```" block when dirty.
+/// - show_commit_reminder is true when the working tree is dirty OR there are
+///   unpushed commits (or the upstream is unknown, treated as likely unpushed).
+pub fn git_commit_reminder() -> (String, bool) {
+    let porcelain = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output();
+
+    let porcelain_out = match porcelain {
+        Ok(ref o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => return (String::new(), false),
+    };
+
+    let dirty = !porcelain_out.is_empty();
+
+    let git_section = if dirty {
+        format!("\n\ngit status:\n```\n{porcelain_out}\n```")
+    } else {
+        String::new()
+    };
+
+    if dirty {
+        return (git_section, true);
+    }
+
+    // Check for unpushed commits.
+    let unpushed = std::process::Command::new("git")
+        .args(["rev-list", "--count", "@{u}..HEAD"])
+        .output();
+
+    match unpushed {
+        Ok(o) if o.status.success() => {
+            let count_str = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let count: u64 = count_str.parse().unwrap_or(0);
+            (git_section, count > 0)
+        }
+        _ => {
+            // No upstream configured or command failed: treat as likely unpushed.
+            (
+                "\n\n(No upstream configured — unpushed commits may be present.)".to_string(),
+                true,
+            )
+        }
+    }
+}

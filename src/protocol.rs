@@ -16,8 +16,49 @@ pub struct AssignRequest {
     pub binary_hash: String,
 }
 
+#[derive(Debug, Clone, Facet)]
+pub struct RespondRequest {
+    pub request_id: String,
+    pub session_name: String,
+    /// Raw response content from the mate (server will format and deliver)
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Facet)]
+pub struct UpdateRequest {
+    pub request_id: String,
+    pub session_name: String,
+    /// Raw update content from the mate (server will format and deliver)
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Facet)]
+pub struct WaitRequest {
+    pub request_id: String,
+    pub session_name: String,
+    /// How long to block waiting for an event (in seconds)
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Facet)]
+#[repr(u8)]
+pub enum WaitEvent {
+    /// A progress update from the mate; more events may follow
+    Update { message: String },
+    /// A response from the mate; captain should review and accept/steer
+    Response { message: String },
+    /// Timed out; no event arrived within the window
+    Timeout,
+}
+
 #[roam::service]
 pub trait Coop {
     /// Assign a task to the worker agent. Returns the request ID.
     async fn assign(&self, req: AssignRequest) -> Result<String, String>;
+    /// Deliver the final response from mate to captain.
+    async fn respond(&self, req: RespondRequest) -> Result<(), String>;
+    /// Send a progress update from mate to captain.
+    async fn update(&self, req: UpdateRequest) -> Result<(), String>;
+    /// Block until a progress update or final response arrives (or timeout).
+    async fn wait(&self, req: WaitRequest) -> Result<WaitEvent, String>;
 }

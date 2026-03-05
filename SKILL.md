@@ -81,6 +81,6 @@ EOF
 
 1. Captain: run `mate issues` to sync context.
 2. Captain: assign tasks, possibly with `--issue`.
-3. Mate: claim and work on tasks, then respond via `mate respond`.
-4. Captain: use `mate update` for status and `mate steer` for clarification.
+3. Mate: work on tasks, then send progress or completion via `mate update`.
+4. Captain: use `mate steer` for clarification or `mate accept` to close the task.
 5. Captain: use `mate show` and `mate wait` to track completion.
