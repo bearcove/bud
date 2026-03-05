@@ -1109,6 +1109,28 @@ async fn process_response_files(
                 None => continue,
             };
             let key = request_key(&session_name, &request_id);
+            let body = match std::fs::read_to_string(&response_path) {
+                Ok(content) => content,
+                Err(_) => "(could not read response file)".to_string(),
+            };
+            if body.trim() == "Accepted" {
+                // Legacy file-based accept marker; accept is RPC-only now.
+                // Dropping this marker avoids double-processing races.
+                let waiter_marker = session_path.join(format!("{request_id}.waiter"));
+                let _ = std::fs::remove_file(&waiter_marker);
+                if let Err(e) = std::fs::remove_file(&response_path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    error!(
+                        "failed to remove legacy accept marker {}: {e}",
+                        response_path.display()
+                    );
+                }
+                info!(
+                    "ignored legacy file-based accept marker for request {request_id} in session {session_name}"
+                );
+                continue;
+            }
 
             let in_memory_request = {
                 let mut reqs = requests.lock().await;
@@ -1159,11 +1181,6 @@ async fn process_response_files(
                 }
             };
 
-            let body = match std::fs::read_to_string(&response_path) {
-                Ok(content) => content,
-                Err(_) => "(could not read response file)".to_string(),
-            };
-            let suppress_pane_delivery = body.trim() == "Accepted";
             let intro = if let Some(title) = title.as_deref() {
                 format!("Fresh from your mate — re: {title}")
             } else {
@@ -1190,9 +1207,7 @@ async fn process_response_files(
                     );
                     continue;
                 }
-            } else if !suppress_pane_delivery
-                && let Err(e) = tmux::send_to_pane(&source_pane, &message)
-            {
+            } else if let Err(e) = tmux::send_to_pane(&source_pane, &message) {
                 error!(
                     "failed to deliver response to pane {} for request {}: {e}",
                     source_pane, request_id
@@ -1219,15 +1234,9 @@ async fn process_response_files(
                 );
             }
 
-            if suppress_pane_delivery {
-                info!(
-                    "accepted request {request_id} in session {session_name} without pane delivery (target pane {target_pane})"
-                );
-            } else {
-                info!(
-                    "delivered response for request {request_id} in session {session_name} (target pane {target_pane})"
-                );
-            }
+            info!(
+                "delivered response for request {request_id} in session {session_name} (target pane {target_pane})"
+            );
 
             let session_empty = {
                 let reqs = requests.lock().await;
