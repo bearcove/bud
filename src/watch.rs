@@ -32,9 +32,8 @@ pub(crate) fn watch_ci_inner(pane: &str) -> Result<()> {
 
 fn run_watch_ci_inner(pane: &str) -> Result<()> {
     let branch = current_branch()?;
-    let run_id = poll_latest_run_id(&branch, std::time::Duration::from_secs(30))?.ok_or_else(|| {
-        eyre::eyre!("no CI run found for branch `{branch}` within 30s")
-    })?;
+    let run_id = poll_latest_run_id(&branch, std::time::Duration::from_secs(30))?
+        .ok_or_else(|| eyre::eyre!("no CI run found for branch `{branch}` within 30s"))?;
 
     let watch_status = std::process::Command::new("gh")
         .args(["run", "watch", &run_id, "--exit-status"])

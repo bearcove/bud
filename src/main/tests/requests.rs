@@ -36,7 +36,8 @@ fn cleanup_created_draft_handles_removed_and_missing_states() {
     assert!(!existing.exists(), "existing draft should be removed");
 
     let missing = root.join("missing.md");
-    let missing_outcome = crate::issues::cleanup_created_draft(&missing).expect("remove missing draft");
+    let missing_outcome =
+        crate::issues::cleanup_created_draft(&missing).expect("remove missing draft");
     assert_eq!(missing_outcome, DraftCleanupOutcome::Missing);
 
     std::fs::remove_dir_all(&root).expect("remove temp directory");

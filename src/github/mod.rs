@@ -261,30 +261,28 @@ pub fn sync_local_issue_edits(repo: &str) -> Result<IssueEditSummary> {
     }
 
     let mut summary = IssueEditSummary::default();
-    trace!("sync_local_issue_edits: read_dir {}", all_dir.display());
     let entries = match std::fs::read_dir(&all_dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(summary),
         Err(e) => return Err(e.into()),
     };
+    let mut total_files = 0usize;
+    let mut skipped_non_file = 0usize;
+    let mut skipped_non_md = 0usize;
 
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        trace!("sync_local_issue_edits: discovered {}", path.display());
+        total_files += 1;
         if !entry.file_type()?.is_file() {
-            trace!(
-                "sync_local_issue_edits: skipped non-file {}",
-                path.display()
-            );
+            skipped_non_file += 1;
             continue;
         }
         if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-            trace!("sync_local_issue_edits: skipped non-md {}", path.display());
+            skipped_non_md += 1;
             continue;
         }
 
-        trace!("sync_local_issue_edits: read_to_string {}", path.display());
         let edited_content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) => {
@@ -307,19 +305,9 @@ pub fn sync_local_issue_edits(repo: &str) -> Result<IssueEditSummary> {
         };
 
         let snapshot_path = snapshot_dir.join(format!("{}.md", edited.number));
-        trace!(
-            "sync_local_issue_edits: read snapshot {}",
-            snapshot_path.display()
-        );
         let baseline_content = match std::fs::read_to_string(&snapshot_path) {
             Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                trace!(
-                    "sync_local_issue_edits: missing snapshot {}",
-                    snapshot_path.display()
-                );
-                continue;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 summary.failed.push(format!(
                     "failed to read snapshot {}: {e}",
@@ -349,10 +337,6 @@ pub fn sync_local_issue_edits(repo: &str) -> Result<IssueEditSummary> {
             continue;
         }
 
-        trace!(
-            "sync_local_issue_edits: apply_issue_edits #{}",
-            edited.number
-        );
         if let Err(e) = apply_issue_edits(repo, &edited, &diff) {
             let detail = format!("failed to sync issue #{} edits: {e}", edited.number);
             summary.failed.push(detail);
@@ -364,6 +348,11 @@ pub fn sync_local_issue_edits(repo: &str) -> Result<IssueEditSummary> {
             changes: diff.changes(edited.number),
         });
     }
+    trace!(
+        "sync_local_issue_edits: scanned {total_files} files, skipped non-file {skipped_non_file}, skipped non-md {skipped_non_md}, applied {}, failed {}",
+        summary.applied.len(),
+        summary.failed.len()
+    );
 
     Ok(summary)
 }
@@ -542,11 +531,12 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
     trace!("write_issue_files: before sync_local_issue_edits");
     let edit_summary = sync_local_issue_edits(repo)?;
     trace!("write_issue_files: after sync_local_issue_edits");
+    let total_issues = issues.len();
     if dir.exists() {
-        trace!(
-            "write_issue_files: directory exists, syncing cleanup in {}",
-            dir.display()
-        );
+        let mut cleaned_paths = 0usize;
+        let mut skipped_paths = 0usize;
+        let mut removed_dirs = 0usize;
+        let mut removed_files = 0usize;
         let sync_paths = [
             "all",
             "open",
@@ -563,22 +553,22 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
         ];
         for path in sync_paths {
             let path = dir.join(path);
-            trace!(
-                "write_issue_files: cleanup path candidate {}",
-                path.display()
-            );
+            cleaned_paths += 1;
             if !path.exists() {
-                trace!("write_issue_files: cleanup skip missing {}", path.display());
+                skipped_paths += 1;
                 continue;
             }
             if path.is_dir() {
-                trace!("write_issue_files: remove_dir_all {}", path.display());
+                removed_dirs += 1;
                 std::fs::remove_dir_all(&path)?;
             } else {
-                trace!("write_issue_files: remove_file {}", path.display());
+                removed_files += 1;
                 std::fs::remove_file(&path)?;
             }
         }
+        trace!(
+            "write_issue_files: cleanup removed dirs {removed_dirs}, files {removed_files}, skipped missing {skipped_paths} of {cleaned_paths} paths"
+        );
     }
 
     let all_dir = dir.join("all");
@@ -588,33 +578,13 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
     let by_updated_dir = dir.join("by-updated");
     let new_dir = dir.join("new");
     let snapshot_dir = dir.join(".snapshots");
-    trace!("write_issue_files: create_dir_all {}", all_dir.display());
     std::fs::create_dir_all(&all_dir)?;
-    trace!("write_issue_files: create_dir_all {}", open_dir.display());
     std::fs::create_dir_all(&open_dir)?;
-    trace!("write_issue_files: create_dir_all {}", closed_dir.display());
     std::fs::create_dir_all(&closed_dir)?;
-    trace!(
-        "write_issue_files: create_dir_all {}",
-        by_created_dir.display()
-    );
     std::fs::create_dir_all(&by_created_dir)?;
-    trace!(
-        "write_issue_files: create_dir_all {}",
-        by_updated_dir.display()
-    );
     std::fs::create_dir_all(&by_updated_dir)?;
-    trace!("write_issue_files: create_dir_all {}", new_dir.display());
     std::fs::create_dir_all(&new_dir)?;
-    trace!(
-        "write_issue_files: create_dir_all {}",
-        snapshot_dir.display()
-    );
     std::fs::create_dir_all(&snapshot_dir)?;
-    trace!(
-        "write_issue_files: write TEMPLATE {}",
-        new_dir.join("TEMPLATE.md").display()
-    );
     std::fs::write(new_dir.join("TEMPLATE.md"), NEW_ISSUE_TEMPLATE)?;
 
     let mut number_to_filename: BTreeMap<u64, String> = BTreeMap::new();
@@ -624,17 +594,8 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
     for issue in issues {
         let filename = issue_filename(issue);
         let issue_content = render_issue(issue);
-        trace!(
-            "write_issue_files: writing issue {} to {}",
-            issue.number,
-            all_dir.join(&filename).display()
-        );
         number_to_filename.insert(issue.number, filename.clone());
         std::fs::write(all_dir.join(&filename), &issue_content)?;
-        trace!(
-            "write_issue_files: writing snapshot {}",
-            snapshot_dir.join(format!("{}.md", issue.number)).display()
-        );
         std::fs::write(
             snapshot_dir.join(format!("{}.md", issue.number)),
             issue_content,
@@ -675,17 +636,18 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
     let has_any_labels = issues.iter().any(|issue| !issue.labels.is_empty());
     let labels_dir = if has_any_labels {
         let root = dir.join("labels");
-        trace!("write_issue_files: create_dir_all {}", root.display());
         std::fs::create_dir_all(&root)?;
+        let mut labels_dirs = 0usize;
         for issue in issues {
             let filename = issue_filename(issue);
             for label in &issue.labels {
                 let label_dir = root.join(sanitize_title_for_filename(&label.name));
-                trace!("write_issue_files: create_dir_all {}", label_dir.display());
+                labels_dirs += 1;
                 std::fs::create_dir_all(&label_dir)?;
                 create_symlink(&format!("../../all/{filename}"), &label_dir.join(&filename))?;
             }
         }
+        trace!("write_issue_files: labels index contains {labels_dirs} label links");
         Some(root)
     } else {
         None
@@ -694,24 +656,22 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
     let has_any_milestones = issues.iter().any(|issue| issue.milestone.is_some());
     let milestones_dir = if has_any_milestones {
         let root = dir.join("milestones");
-        trace!("write_issue_files: create_dir_all {}", root.display());
         std::fs::create_dir_all(&root)?;
+        let mut milestones_dirs = 0usize;
         for issue in issues {
             let Some(milestone) = issue.milestone.as_ref() else {
                 continue;
             };
             let filename = issue_filename(issue);
             let milestone_dir = root.join(sanitize_title_for_filename(&milestone.title));
-            trace!(
-                "write_issue_files: create_dir_all {}",
-                milestone_dir.display()
-            );
+            milestones_dirs += 1;
             std::fs::create_dir_all(&milestone_dir)?;
             create_symlink(
                 &format!("../../all/{filename}"),
                 &milestone_dir.join(&filename),
             )?;
         }
+        trace!("write_issue_files: milestones index contains {milestones_dirs} issue links");
         Some(root)
     } else {
         None
@@ -769,6 +729,14 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
         &milestones_markdown_path,
         render_milestones_markdown(repo, &milestones),
     )?;
+
+    trace!(
+        "write_issue_files: completed sync for {repo} with {total_issues} issues ({open_count} open, {closed_count} closed), applied {} edits, {} edit failures",
+        edit_summary.applied.len(),
+        edit_summary.failed.len(),
+        open_count = open_issues.len(),
+        closed_count = closed_issues.len(),
+    );
 
     Ok(IssueSyncResult {
         base_dir: dir,
@@ -1027,7 +995,6 @@ fn apply_issue_edits(repo: &str, edited: &ParsedIssueFile, diff: &IssueFieldDiff
 
     Ok(())
 }
-
 
 pub fn create_issue(repo: &str, issue: &NewIssue) -> Result<(u64, String)> {
     let mut cmd = Command::new("gh");
@@ -1573,7 +1540,6 @@ pub fn sync_milestones_set(repo: &str) -> Result<BTreeSet<String>> {
     let milestones = sync_milestones(repo)?;
     Ok(milestones.into_iter().collect())
 }
-
 
 #[cfg(test)]
 mod tests;

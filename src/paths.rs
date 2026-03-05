@@ -1,6 +1,6 @@
 use eyre::Result;
-use std::path::PathBuf;
 use std::io::Read as _;
+use std::path::PathBuf;
 
 pub(crate) fn socket_path() -> PathBuf {
     std::env::var("MATE_SOCKET")

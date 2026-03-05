@@ -3,13 +3,13 @@ mod config;
 mod discord;
 mod github;
 mod hash;
+mod issues;
+mod listing;
 mod pane;
 mod paths;
 mod protocol;
-mod server;
-mod listing;
-mod issues;
 mod requests;
+mod server;
 mod tmux;
 mod util;
 mod warmth;
@@ -190,7 +190,7 @@ async fn main() -> Result<()> {
         Some(Command::Steer { request_id }) => client::steer_request(&request_id).await,
         Some(Command::Accept { request_id }) => client::accept_request(&request_id).await,
         Some(Command::Update { request_id }) => client::update_request(&request_id).await,
-        Some(Command::Issues) => issues::sync_issues_to_pane(),
+        Some(Command::Issues) => issues::sync_issues(),
         Some(Command::Compact) => requests::compact_context(),
         Some(Command::Assign { keep, title, issue }) => {
             let pane = std::env::var("TMUX_PANE")
@@ -216,7 +216,6 @@ async fn main() -> Result<()> {
         Some(Command::_WatchInner { pane }) => watch::watch_ci_inner(&pane),
     }
 }
-
 
 #[cfg(test)]
 #[path = "main/tests.rs"]

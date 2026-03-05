@@ -32,11 +32,7 @@ const RESPONDED: &[&str] = &[
 ];
 
 /// Said to the assigner when the response arrives.
-const DELIVERED: &[&str] = &[
-    "From your mate:",
-    "Mate's response:",
-    "Response:",
-];
+const DELIVERED: &[&str] = &["From your mate:", "Mate's response:", "Response:"];
 
 pub fn assigned() -> &'static str {
     pick(ASSIGNED)

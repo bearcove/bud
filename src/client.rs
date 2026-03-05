@@ -129,7 +129,9 @@ pub(crate) fn print_request_followup_help(request_id: &str) {
     eprintln!(
         "  mate spy {request_id}                         - peek at what your mate's pane looks like right now"
     );
-    eprintln!("  mate list                                 - see all in-flight requests and their status");
+    eprintln!(
+        "  mate list                                 - see all in-flight requests and their status"
+    );
     eprintln!(
         "  cat <<'EOF' | mate steer {request_id}         - send a mid-task clarification or course correction"
     );
@@ -343,7 +345,8 @@ pub(crate) async fn wait_for_response(request_id: &str, timeout_secs: u64) -> Re
                         let status_suffix = if buddy_pane.is_empty() {
                             String::new()
                         } else {
-                            let capture = crate::tmux::capture_pane(&buddy_pane).unwrap_or_default();
+                            let capture =
+                                crate::tmux::capture_pane(&buddy_pane).unwrap_or_default();
                             let parsed = crate::pane::parse_pane_content(&capture);
                             if let Some(agent_type) = parsed.agent_type {
                                 let agent = match agent_type {

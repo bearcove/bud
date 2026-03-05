@@ -1,4 +1,4 @@
-use crate::issues::{format_missing_draft_message, DraftMissingStage};
+use crate::issues::{DraftMissingStage, format_missing_draft_message};
 use std::path::Path;
 
 #[test]

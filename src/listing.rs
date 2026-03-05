@@ -20,7 +20,12 @@ impl IdleTracker {
         }
     }
 
-    pub(crate) fn update(&mut self, session: &str, pane: &str, state: &pane::AgentState) -> Option<u64> {
+    pub(crate) fn update(
+        &mut self,
+        session: &str,
+        pane: &str,
+        state: &pane::AgentState,
+    ) -> Option<u64> {
         let key = (session.to_string(), pane.to_string());
         let previous_idle_since = if let Some(entry) = self.cache.get(&key) {
             *entry
@@ -227,7 +232,10 @@ pub(crate) fn render_agent_blocks(rows: &[AgentListRow]) -> String {
     blocks.join("\n\n")
 }
 
-pub(crate) fn render_session_groups(request_rows: &[RequestListRow], agent_rows: &[AgentListRow]) -> String {
+pub(crate) fn render_session_groups(
+    request_rows: &[RequestListRow],
+    agent_rows: &[AgentListRow],
+) -> String {
     let mut sessions: BTreeSet<String> = BTreeSet::new();
     for row in request_rows {
         sessions.insert(row.session.clone());
@@ -281,7 +289,11 @@ pub(crate) fn format_agent_task_summary(request_id: &str, title: Option<&str>) -
     }
 }
 
-pub(crate) fn classify_agent_role(session: &str, pane_id: &str, requests: &[RequestListRow]) -> &'static str {
+pub(crate) fn classify_agent_role(
+    session: &str,
+    pane_id: &str,
+    requests: &[RequestListRow],
+) -> &'static str {
     let mut is_source = false;
     let mut is_target = false;
     for request in requests.iter().filter(|request| request.session == session) {

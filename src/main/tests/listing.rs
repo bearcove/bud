@@ -1,7 +1,7 @@
 use crate::listing::{
     AgentListRow, IdleTracker, RequestListRow, classify_agent_role, format_agent_task_summary,
-    format_context_line, format_idle_seconds, format_status, render_agent_blocks, render_request_blocks,
-    render_session_groups,
+    format_context_line, format_idle_seconds, format_status, render_agent_blocks,
+    render_request_blocks, render_session_groups,
 };
 
 #[test]

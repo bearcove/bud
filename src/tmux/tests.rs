@@ -3,13 +3,19 @@ use super::*;
 #[test]
 fn prepare_outgoing_text_appends_marker_for_regular_text() {
     let marker = "🦊🪐🧿";
-    assert_eq!(prepare_outgoing_text("hello world", marker), "hello world 🦊🪐🧿");
+    assert_eq!(
+        prepare_outgoing_text("hello world", marker),
+        "hello world 🦊🪐🧿"
+    );
 }
 
 #[test]
 fn prepare_outgoing_text_appends_marker_for_multiline_text() {
     let marker = "🦊🪐🧿";
-    assert_eq!(prepare_outgoing_text("line1\nline2", marker), "line1\nline2 🦊🪐🧿");
+    assert_eq!(
+        prepare_outgoing_text("line1\nline2", marker),
+        "line1\nline2 🦊🪐🧿"
+    );
 }
 
 #[test]

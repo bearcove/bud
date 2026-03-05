@@ -132,9 +132,7 @@ pub fn git_commit_reminder() -> (String, bool) {
         .output();
 
     let porcelain_out = match porcelain {
-        Ok(ref o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
+        Ok(ref o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => return (String::new(), false),
     };
 
