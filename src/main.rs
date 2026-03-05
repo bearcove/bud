@@ -190,7 +190,7 @@ async fn main() -> Result<()> {
         Some(Command::Steer { request_id }) => client::steer_request(&request_id).await,
         Some(Command::Accept { request_id }) => client::accept_request(&request_id).await,
         Some(Command::Update { request_id }) => client::update_request(&request_id).await,
-        Some(Command::Issues) => issues::sync_issues(),
+        Some(Command::Issues) => issues::sync_issues().await,
         Some(Command::Compact) => requests::compact_context().await,
         Some(Command::Assign { keep, title, issue }) => {
             let pane = std::env::var("TMUX_PANE")

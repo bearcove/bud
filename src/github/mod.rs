@@ -3,7 +3,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tracing::trace;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,10 +144,11 @@ const NEW_ISSUE_TEMPLATE: &str = r#"# Issue title here
 Issue body goes here. Describe the problem or feature request.
 "#;
 
-pub fn infer_repo() -> Result<String> {
-    let output = Command::new("git")
+pub async fn infer_repo() -> Result<String> {
+    let output = tokio::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
-        .output()?;
+        .output()
+        .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(eyre::eyre!(
@@ -249,19 +249,23 @@ pub fn parse_issue_file(content: &str) -> Result<ParsedIssueFile> {
     })
 }
 
-pub fn sync_local_issue_edits(repo: &str) -> Result<IssueEditSummary> {
+pub async fn sync_local_issue_edits(repo: &str) -> Result<IssueEditSummary> {
     trace!("sync_local_issue_edits: enter for repo {repo}");
     let base_dir = issue_repo_dir(repo);
     let all_dir = base_dir.join("all");
     let snapshot_dir = base_dir.join(".snapshots");
 
-    if !all_dir.is_dir() {
+    if tokio::fs::metadata(&all_dir)
+        .await
+        .map(|meta| !meta.is_dir())
+        .unwrap_or(true)
+    {
         trace!("sync_local_issue_edits: no all dir {}", all_dir.display());
         return Ok(IssueEditSummary::default());
     }
 
     let mut summary = IssueEditSummary::default();
-    let entries = match std::fs::read_dir(&all_dir) {
+    let mut entries = match tokio::fs::read_dir(&all_dir).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(summary),
         Err(e) => return Err(e.into()),
@@ -270,11 +274,10 @@ pub fn sync_local_issue_edits(repo: &str) -> Result<IssueEditSummary> {
     let mut skipped_non_file = 0usize;
     let mut skipped_non_md = 0usize;
 
-    for entry in entries {
-        let entry = entry?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         total_files += 1;
-        if !entry.file_type()?.is_file() {
+        if !entry.file_type().await?.is_file() {
             skipped_non_file += 1;
             continue;
         }
@@ -283,7 +286,7 @@ pub fn sync_local_issue_edits(repo: &str) -> Result<IssueEditSummary> {
             continue;
         }
 
-        let edited_content = match std::fs::read_to_string(&path) {
+        let edited_content = match tokio::fs::read_to_string(&path).await {
             Ok(content) => content,
             Err(e) => {
                 summary
@@ -305,7 +308,7 @@ pub fn sync_local_issue_edits(repo: &str) -> Result<IssueEditSummary> {
         };
 
         let snapshot_path = snapshot_dir.join(format!("{}.md", edited.number));
-        let baseline_content = match std::fs::read_to_string(&snapshot_path) {
+        let baseline_content = match tokio::fs::read_to_string(&snapshot_path).await {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
@@ -337,7 +340,7 @@ pub fn sync_local_issue_edits(repo: &str) -> Result<IssueEditSummary> {
             continue;
         }
 
-        if let Err(e) = apply_issue_edits(repo, &edited, &diff) {
+        if let Err(e) = apply_issue_edits(repo, &edited, &diff).await {
             let detail = format!("failed to sync issue #{} edits: {e}", edited.number);
             summary.failed.push(detail);
             continue;
@@ -387,8 +390,8 @@ pub fn read_issue_file(repo: &str, number: u64) -> Result<String> {
     ))
 }
 
-pub fn sync_issues(repo: &str) -> Result<Vec<Issue>> {
-    let output = Command::new("gh")
+pub async fn sync_issues(repo: &str) -> Result<Vec<Issue>> {
+    let output = tokio::process::Command::new("gh")
         .args([
             "issue",
             "list",
@@ -399,7 +402,8 @@ pub fn sync_issues(repo: &str) -> Result<Vec<Issue>> {
             "--limit",
             "100",
         ])
-        .output()?;
+        .output()
+        .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(eyre::eyre!("gh issue list failed: {stderr}"));
@@ -408,8 +412,8 @@ pub fn sync_issues(repo: &str) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 
-pub fn sync_labels(repo: &str) -> Result<Vec<RepoLabel>> {
-    let output = Command::new("gh")
+pub async fn sync_labels(repo: &str) -> Result<Vec<RepoLabel>> {
+    let output = tokio::process::Command::new("gh")
         .args([
             "label",
             "list",
@@ -420,7 +424,8 @@ pub fn sync_labels(repo: &str) -> Result<Vec<RepoLabel>> {
             "--limit",
             "100",
         ])
-        .output()?;
+        .output()
+        .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(eyre::eyre!("gh label list failed: {stderr}"));
@@ -429,12 +434,13 @@ pub fn sync_labels(repo: &str) -> Result<Vec<RepoLabel>> {
     Ok(labels)
 }
 
-pub fn sync_milestones(repo: &str) -> Result<Vec<String>> {
+pub async fn sync_milestones(repo: &str) -> Result<Vec<String>> {
     let (owner, name) = split_repo(repo)?;
     let endpoint = format!("repos/{owner}/{name}/milestones");
-    let output = Command::new("gh")
+    let output = tokio::process::Command::new("gh")
         .args(["api", &endpoint, "--jq", ".[].title"])
-        .output()?;
+        .output()
+        .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(eyre::eyre!("gh api milestones failed: {stderr}"));
@@ -448,7 +454,7 @@ pub fn sync_milestones(repo: &str) -> Result<Vec<String>> {
     Ok(milestones)
 }
 
-pub fn fetch_issue_relationships(
+pub async fn fetch_issue_relationships(
     repo: &str,
     issue_numbers: &[u64],
 ) -> Result<BTreeMap<u64, IssueRelationships>> {
@@ -481,10 +487,11 @@ issue_{number}: repository(owner: "{owner}", name: "{name}") {{
         }
         query.push('}');
 
-        let output = Command::new("gh")
+        let output = tokio::process::Command::new("gh")
             .args(["api", "graphql", "-f"])
             .arg(format!("query={query}"))
-            .output()?;
+            .output()
+            .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(eyre::eyre!("gh api graphql failed: {stderr}"));
@@ -524,15 +531,15 @@ issue_{number}: repository(owner: "{owner}", name: "{name}") {{
     Ok(map)
 }
 
-pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult> {
+pub async fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult> {
     trace!("write_issue_files: enter repo {repo}");
     let dir = issue_repo_dir(repo);
 
     trace!("write_issue_files: before sync_local_issue_edits");
-    let edit_summary = sync_local_issue_edits(repo)?;
+    let edit_summary = sync_local_issue_edits(repo).await?;
     trace!("write_issue_files: after sync_local_issue_edits");
     let total_issues = issues.len();
-    if dir.exists() {
+    if tokio::fs::metadata(&dir).await.is_ok() {
         let mut cleaned_paths = 0usize;
         let mut skipped_paths = 0usize;
         let mut removed_dirs = 0usize;
@@ -554,16 +561,16 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
         for path in sync_paths {
             let path = dir.join(path);
             cleaned_paths += 1;
-            if !path.exists() {
+            if tokio::fs::metadata(&path).await.is_err() {
                 skipped_paths += 1;
                 continue;
             }
-            if path.is_dir() {
+            if tokio::fs::metadata(&path).await?.is_dir() {
                 removed_dirs += 1;
-                std::fs::remove_dir_all(&path)?;
+                tokio::fs::remove_dir_all(&path).await?;
             } else {
                 removed_files += 1;
-                std::fs::remove_file(&path)?;
+                tokio::fs::remove_file(&path).await?;
             }
         }
         trace!(
@@ -578,14 +585,14 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
     let by_updated_dir = dir.join("by-updated");
     let new_dir = dir.join("new");
     let snapshot_dir = dir.join(".snapshots");
-    std::fs::create_dir_all(&all_dir)?;
-    std::fs::create_dir_all(&open_dir)?;
-    std::fs::create_dir_all(&closed_dir)?;
-    std::fs::create_dir_all(&by_created_dir)?;
-    std::fs::create_dir_all(&by_updated_dir)?;
-    std::fs::create_dir_all(&new_dir)?;
-    std::fs::create_dir_all(&snapshot_dir)?;
-    std::fs::write(new_dir.join("TEMPLATE.md"), NEW_ISSUE_TEMPLATE)?;
+    tokio::fs::create_dir_all(&all_dir).await?;
+    tokio::fs::create_dir_all(&open_dir).await?;
+    tokio::fs::create_dir_all(&closed_dir).await?;
+    tokio::fs::create_dir_all(&by_created_dir).await?;
+    tokio::fs::create_dir_all(&by_updated_dir).await?;
+    tokio::fs::create_dir_all(&new_dir).await?;
+    tokio::fs::create_dir_all(&snapshot_dir).await?;
+    tokio::fs::write(new_dir.join("TEMPLATE.md"), NEW_ISSUE_TEMPLATE).await?;
 
     let mut number_to_filename: BTreeMap<u64, String> = BTreeMap::new();
     let mut open_issues: Vec<&Issue> = Vec::new();
@@ -595,18 +602,19 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
         let filename = issue_filename(issue);
         let issue_content = render_issue(issue);
         number_to_filename.insert(issue.number, filename.clone());
-        std::fs::write(all_dir.join(&filename), &issue_content)?;
-        std::fs::write(
+        tokio::fs::write(all_dir.join(&filename), &issue_content).await?;
+        tokio::fs::write(
             snapshot_dir.join(format!("{}.md", issue.number)),
             issue_content,
-        )?;
+        )
+        .await?;
 
         let link_target = format!("../all/{filename}");
         if issue.state.eq_ignore_ascii_case("open") {
-            create_symlink(&link_target, &open_dir.join(&filename))?;
+            create_symlink(&link_target, &open_dir.join(&filename)).await?;
             open_issues.push(issue);
         } else {
-            create_symlink(&link_target, &closed_dir.join(&filename))?;
+            create_symlink(&link_target, &closed_dir.join(&filename)).await?;
             closed_issues.push(issue);
         }
 
@@ -619,7 +627,8 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
         create_symlink(
             &format!("../../all/{filename}"),
             &by_created_dir.join(created_link_name),
-        )?;
+        )
+        .await?;
 
         let updated_link_name = format!(
             "{} #{} - {}.md",
@@ -630,21 +639,23 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
         create_symlink(
             &format!("../../all/{filename}"),
             &by_updated_dir.join(updated_link_name),
-        )?;
+        )
+        .await?;
     }
 
     let has_any_labels = issues.iter().any(|issue| !issue.labels.is_empty());
     let labels_dir = if has_any_labels {
         let root = dir.join("labels");
-        std::fs::create_dir_all(&root)?;
+        tokio::fs::create_dir_all(&root).await?;
         let mut labels_dirs = 0usize;
         for issue in issues {
             let filename = issue_filename(issue);
             for label in &issue.labels {
                 let label_dir = root.join(sanitize_title_for_filename(&label.name));
                 labels_dirs += 1;
-                std::fs::create_dir_all(&label_dir)?;
-                create_symlink(&format!("../../all/{filename}"), &label_dir.join(&filename))?;
+                tokio::fs::create_dir_all(&label_dir).await?;
+                create_symlink(&format!("../../all/{filename}"), &label_dir.join(&filename))
+                    .await?;
             }
         }
         trace!("write_issue_files: labels index contains {labels_dirs} label links");
@@ -656,7 +667,7 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
     let has_any_milestones = issues.iter().any(|issue| issue.milestone.is_some());
     let milestones_dir = if has_any_milestones {
         let root = dir.join("milestones");
-        std::fs::create_dir_all(&root)?;
+        tokio::fs::create_dir_all(&root).await?;
         let mut milestones_dirs = 0usize;
         for issue in issues {
             let Some(milestone) = issue.milestone.as_ref() else {
@@ -665,11 +676,12 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
             let filename = issue_filename(issue);
             let milestone_dir = root.join(sanitize_title_for_filename(&milestone.title));
             milestones_dirs += 1;
-            std::fs::create_dir_all(&milestone_dir)?;
+            tokio::fs::create_dir_all(&milestone_dir).await?;
             create_symlink(
                 &format!("../../all/{filename}"),
                 &milestone_dir.join(&filename),
-            )?;
+            )
+            .await?;
         }
         trace!("write_issue_files: milestones index contains {milestones_dirs} issue links");
         Some(root)
@@ -682,21 +694,25 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
 
     let index_path = dir.join("INDEX.md");
     trace!("write_issue_files: write index {}", index_path.display());
-    std::fs::write(
+    tokio::fs::write(
         &index_path,
-        render_index(repo, &open_issues, &closed_issues, issues),
-    )?;
+        render_index(repo, &open_issues, &closed_issues, issues).await,
+    )
+    .await?;
 
     let issue_numbers = issues.iter().map(|i| i.number).collect::<Vec<_>>();
     let deps_markdown_path = dir.join("DEPS.md");
-    let deps_path = match fetch_issue_relationships(repo, &issue_numbers) {
-        Ok(relationships) => write_deps(
-            repo,
-            &dir,
-            &deps_markdown_path,
-            &relationships,
-            &number_to_filename,
-        )?,
+    let deps_path = match fetch_issue_relationships(repo, &issue_numbers).await {
+        Ok(relationships) => {
+            write_deps(
+                repo,
+                &dir,
+                &deps_markdown_path,
+                &relationships,
+                &number_to_filename,
+            )
+            .await?
+        }
         Err(e) => {
             eprintln!("Warning: could not fetch issue dependencies (GraphQL): {e}");
             let deps_md = format!(
@@ -706,7 +722,7 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
                 "write_issue_files: write fallback deps {}",
                 deps_markdown_path.display()
             );
-            std::fs::write(&deps_markdown_path, deps_md)?;
+            tokio::fs::write(&deps_markdown_path, deps_md).await?;
             None
         }
     };
@@ -716,19 +732,20 @@ pub fn write_issue_files(repo: &str, issues: &[Issue]) -> Result<IssueSyncResult
         "write_issue_files: write labels markdown {}",
         labels_markdown_path.display()
     );
-    let labels = sync_labels(repo)?;
-    std::fs::write(&labels_markdown_path, render_labels_markdown(repo, &labels))?;
+    let labels = sync_labels(repo).await?;
+    tokio::fs::write(&labels_markdown_path, render_labels_markdown(repo, &labels)).await?;
 
     let milestones_markdown_path = dir.join("MILESTONES.md");
     trace!(
         "write_issue_files: write milestones markdown {}",
         milestones_markdown_path.display()
     );
-    let milestones = sync_milestones(repo)?;
-    std::fs::write(
+    let milestones = sync_milestones(repo).await?;
+    tokio::fs::write(
         &milestones_markdown_path,
         render_milestones_markdown(repo, &milestones),
-    )?;
+    )
+    .await?;
 
     trace!(
         "write_issue_files: completed sync for {repo} with {total_issues} issues ({open_count} open, {closed_count} closed), applied {} edits, {} edit failures",
@@ -923,13 +940,17 @@ impl IssueFieldDiff {
     }
 }
 
-fn apply_issue_edits(repo: &str, edited: &ParsedIssueFile, diff: &IssueFieldDiff) -> Result<()> {
+async fn apply_issue_edits(
+    repo: &str,
+    edited: &ParsedIssueFile,
+    diff: &IssueFieldDiff,
+) -> Result<()> {
     if diff.is_empty() {
         return Ok(());
     }
 
     if diff.has_non_state_edits() {
-        let mut cmd = Command::new("gh");
+        let mut cmd = tokio::process::Command::new("gh");
         cmd.args(["issue", "edit", "-R", repo, &edited.number.to_string()]);
 
         if let Some(title) = diff.title.as_deref() {
@@ -957,7 +978,7 @@ fn apply_issue_edits(repo: &str, edited: &ParsedIssueFile, diff: &IssueFieldDiff
             cmd.args(["--remove-assignee", assignee]);
         }
 
-        let output = cmd.output()?;
+        let output = cmd.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(eyre::eyre!("gh issue edit failed: {stderr}"));
@@ -965,7 +986,7 @@ fn apply_issue_edits(repo: &str, edited: &ParsedIssueFile, diff: &IssueFieldDiff
     }
 
     if let Some(state) = diff.state.as_deref() {
-        let mut state_cmd = Command::new("gh");
+        let mut state_cmd = tokio::process::Command::new("gh");
         match state {
             "closed" => {
                 state_cmd.args(["issue", "close", "-R", repo, &edited.number.to_string()]);
@@ -980,7 +1001,7 @@ fn apply_issue_edits(repo: &str, edited: &ParsedIssueFile, diff: &IssueFieldDiff
                 ));
             }
         }
-        let state_output = state_cmd.output()?;
+        let state_output = state_cmd.output().await?;
         if !state_output.status.success() {
             let stderr = String::from_utf8_lossy(&state_output.stderr)
                 .trim()
@@ -996,8 +1017,8 @@ fn apply_issue_edits(repo: &str, edited: &ParsedIssueFile, diff: &IssueFieldDiff
     Ok(())
 }
 
-pub fn create_issue(repo: &str, issue: &NewIssue) -> Result<(u64, String)> {
-    let mut cmd = Command::new("gh");
+pub async fn create_issue(repo: &str, issue: &NewIssue) -> Result<(u64, String)> {
+    let mut cmd = tokio::process::Command::new("gh");
     cmd.args([
         "issue",
         "create",
@@ -1018,7 +1039,7 @@ pub fn create_issue(repo: &str, issue: &NewIssue) -> Result<(u64, String)> {
         cmd.args(["--assignee", assignee]);
     }
 
-    let output = cmd.output()?;
+    let output = cmd.output().await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(eyre::eyre!("gh issue create failed: {stderr}"));
@@ -1031,8 +1052,8 @@ pub fn create_issue(repo: &str, issue: &NewIssue) -> Result<(u64, String)> {
     Ok((issue_number, stdout))
 }
 
-pub fn ensure_label_exists(repo: &str, label: &str) -> Result<()> {
-    let output = Command::new("gh")
+pub async fn ensure_label_exists(repo: &str, label: &str) -> Result<()> {
+    let output = tokio::process::Command::new("gh")
         .args([
             "label",
             "create",
@@ -1044,7 +1065,8 @@ pub fn ensure_label_exists(repo: &str, label: &str) -> Result<()> {
             "--description",
             "Created by mate issue-create",
         ])
-        .output()?;
+        .output()
+        .await?;
     if output.status.success() {
         return Ok(());
     }
@@ -1058,13 +1080,14 @@ pub fn ensure_label_exists(repo: &str, label: &str) -> Result<()> {
     ))
 }
 
-pub fn ensure_milestone_exists(repo: &str, milestone: &str) -> Result<()> {
+pub async fn ensure_milestone_exists(repo: &str, milestone: &str) -> Result<()> {
     let (owner, name) = split_repo(repo)?;
     let endpoint = format!("repos/{owner}/{name}/milestones");
-    let output = Command::new("gh")
+    let output = tokio::process::Command::new("gh")
         .args(["api", &endpoint, "-X", "POST", "-f"])
         .arg(format!("title={milestone}"))
-        .output()?;
+        .output()
+        .await?;
     if output.status.success() {
         return Ok(());
     }
@@ -1086,7 +1109,7 @@ pub fn issue_filename_for_number_title(number: u64, title: &str) -> String {
     format!("{number} - {safe}.md")
 }
 
-fn write_deps(
+async fn write_deps(
     repo: &str,
     dir: &Path,
     deps_markdown_path: &Path,
@@ -1111,8 +1134,9 @@ fn write_deps(
             for other in &rel.blocked_by {
                 if let Some(filename) = number_to_filename.get(number) {
                     let target_dir = deps_dir.join(format!("blocked-by-{other}"));
-                    std::fs::create_dir_all(&target_dir)?;
-                    create_symlink(&format!("../../all/{filename}"), &target_dir.join(filename))?;
+                    tokio::fs::create_dir_all(&target_dir).await?;
+                    create_symlink(&format!("../../all/{filename}"), &target_dir.join(filename))
+                        .await?;
                     deps_dir_created = true;
                 }
             }
@@ -1126,8 +1150,9 @@ fn write_deps(
             for other in &rel.blocking {
                 if let Some(filename) = number_to_filename.get(number) {
                     let target_dir = deps_dir.join(format!("blocks-{other}"));
-                    std::fs::create_dir_all(&target_dir)?;
-                    create_symlink(&format!("../../all/{filename}"), &target_dir.join(filename))?;
+                    tokio::fs::create_dir_all(&target_dir).await?;
+                    create_symlink(&format!("../../all/{filename}"), &target_dir.join(filename))
+                        .await?;
                     deps_dir_created = true;
                 }
             }
@@ -1184,7 +1209,7 @@ fn write_deps(
         }
         deps_md.push('\n');
     }
-    std::fs::write(deps_markdown_path, deps_md)?;
+    tokio::fs::write(deps_markdown_path, deps_md).await?;
 
     Ok(if deps_dir_created {
         Some(deps_dir)
@@ -1234,12 +1259,12 @@ fn render_milestones_markdown(repo: &str, milestones: &[String]) -> String {
     out
 }
 
-fn create_symlink(target: &str, link: &Path) -> Result<()> {
+async fn create_symlink(target: &str, link: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
-        if link.exists() {
-            std::fs::remove_file(link)?;
+        if tokio::fs::metadata(link).await.is_ok() {
+            tokio::fs::remove_file(link).await?;
         }
         symlink(target, link)?;
         Ok(())
@@ -1340,7 +1365,7 @@ fn render_issue(issue: &Issue) -> String {
     content
 }
 
-fn render_index(
+async fn render_index(
     repo: &str,
     open_issues: &[&Issue],
     closed_issues: &[&Issue],
@@ -1348,7 +1373,7 @@ fn render_index(
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Issues for {repo}\n\n"));
-    out.push_str(&format!("Synced: {}\n\n", today_ymd()));
+    out.push_str(&format!("Synced: {}\n\n", today_ymd().await));
 
     out.push_str(&format!("## Open ({})\n\n", open_issues.len()));
     for issue in open_issues {
@@ -1434,8 +1459,11 @@ fn short_date(value: &str) -> &str {
     value.get(..10).unwrap_or(value)
 }
 
-fn today_ymd() -> String {
-    let output = Command::new("date").arg("+%F").output();
+async fn today_ymd() -> String {
+    let output = tokio::process::Command::new("date")
+        .arg("+%F")
+        .output()
+        .await;
     if let Ok(output) = output
         && output.status.success()
     {
@@ -1531,13 +1559,13 @@ fn parse_issue_number_from_create_output(output: &str) -> Option<u64> {
         .ok()
 }
 
-pub fn sync_labels_set(repo: &str) -> Result<BTreeSet<String>> {
-    let labels = sync_labels(repo)?;
+pub async fn sync_labels_set(repo: &str) -> Result<BTreeSet<String>> {
+    let labels = sync_labels(repo).await?;
     Ok(labels.into_iter().map(|l| l.name).collect())
 }
 
-pub fn sync_milestones_set(repo: &str) -> Result<BTreeSet<String>> {
-    let milestones = sync_milestones(repo)?;
+pub async fn sync_milestones_set(repo: &str) -> Result<BTreeSet<String>> {
+    let milestones = sync_milestones(repo).await?;
     Ok(milestones.into_iter().collect())
 }
 

@@ -24,20 +24,23 @@ fn captain_update_includes_buddy_response_instructions() {
     assert!(!update.contains("mate respond deadbeef"));
 }
 
-#[test]
-fn cleanup_created_draft_handles_removed_and_missing_states() {
+#[tokio::test]
+async fn cleanup_created_draft_handles_removed_and_missing_states() {
     let root = std::env::temp_dir().join(format!("mate-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).expect("create temp directory");
     let existing = root.join("existing.md");
     std::fs::write(&existing, "draft").expect("write draft file");
 
-    let removed = crate::issues::cleanup_created_draft(&existing).expect("remove existing draft");
+    let removed = crate::issues::cleanup_created_draft(&existing)
+        .await
+        .expect("remove existing draft");
     assert_eq!(removed, DraftCleanupOutcome::Removed);
     assert!(!existing.exists(), "existing draft should be removed");
 
     let missing = root.join("missing.md");
-    let missing_outcome =
-        crate::issues::cleanup_created_draft(&missing).expect("remove missing draft");
+    let missing_outcome = crate::issues::cleanup_created_draft(&missing)
+        .await
+        .expect("remove missing draft");
     assert_eq!(missing_outcome, DraftCleanupOutcome::Missing);
 
     std::fs::remove_dir_all(&root).expect("remove temp directory");

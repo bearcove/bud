@@ -3,18 +3,18 @@ use tracing::trace;
 
 use crate::github;
 
-pub(crate) fn sync_issues() -> Result<()> {
+pub(crate) async fn sync_issues() -> Result<()> {
     trace!("sync_issues: enter");
-    let repo = github::infer_repo()?;
+    let repo = github::infer_repo().await?;
     eprintln!("Syncing issues for {repo}...");
 
     trace!("sync_issues: before process_pending_issue_drafts");
-    let (created, failed) = process_pending_issue_drafts(&repo)?;
+    let (created, failed) = process_pending_issue_drafts(&repo).await?;
 
     trace!("sync_issues: before github::sync_issues");
-    let issues = github::sync_issues(&repo)?;
+    let issues = github::sync_issues(&repo).await?;
     trace!("sync_issues: before github::write_issue_files");
-    let result = github::write_issue_files(&repo, &issues)?;
+    let result = github::write_issue_files(&repo, &issues).await?;
     trace!("sync_issues: after github::write_issue_files");
 
     let mut summary = String::new();
@@ -118,11 +118,11 @@ pub(crate) fn format_missing_draft_message(
     }
 }
 
-pub(crate) fn cleanup_created_draft(
+pub(crate) async fn cleanup_created_draft(
     path: &std::path::Path,
 ) -> std::io::Result<DraftCleanupOutcome> {
     trace!("cleanup_created_draft: attempt {}", path.display());
-    match fs_err::remove_file(path) {
+    match tokio::fs::remove_file(path).await {
         Ok(()) => {
             trace!("cleanup_created_draft: removed {}", path.display());
             Ok(DraftCleanupOutcome::Removed)
@@ -144,38 +144,35 @@ pub(crate) fn cleanup_created_draft(
     }
 }
 
-fn process_pending_issue_drafts(
+async fn process_pending_issue_drafts(
     repo: &str,
 ) -> Result<(Vec<PendingIssueCreated>, Vec<PendingIssueFailed>)> {
     use std::io::ErrorKind;
 
     let base_dir = github::issue_repo_dir(repo);
     let new_dir = base_dir.join("new");
-    if !new_dir.is_dir() {
+    if tokio::fs::metadata(&new_dir)
+        .await
+        .map(|meta| !meta.is_dir())
+        .unwrap_or(true)
+    {
         trace!("process_pending_issue_drafts: new dir missing");
         return Ok((Vec::new(), Vec::new()));
     }
 
     let failed_dir = base_dir.join("failed");
-    fs_err::create_dir_all(&failed_dir)?;
+    tokio::fs::create_dir_all(&failed_dir).await?;
 
     let mut total_entries = 0usize;
     let mut filtered_non_file = 0usize;
     let mut filtered_non_md = 0usize;
     let mut filtered_template = 0usize;
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    let entries = fs_err::read_dir(&new_dir)?;
-    for entry in entries {
-        let entry = match entry {
-            Ok(value) => value,
-            Err(e) => {
-                trace!("process_pending_issue_drafts: read_dir entry error: {e}");
-                continue;
-            }
-        };
+    let mut entries = tokio::fs::read_dir(&new_dir).await?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
         let raw_path = entry.path();
         total_entries += 1;
-        if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
+        if !entry.file_type().await.is_ok_and(|ft| ft.is_file()) {
             filtered_non_file += 1;
             continue;
         }
@@ -202,8 +199,8 @@ fn process_pending_issue_drafts(
         paths.len()
     );
 
-    let mut existing_labels = github::sync_labels_set(repo)?;
-    let mut existing_milestones = github::sync_milestones_set(repo)?;
+    let mut existing_labels = github::sync_labels_set(repo).await?;
+    let mut existing_milestones = github::sync_milestones_set(repo).await?;
     let mut created = Vec::new();
     let mut failed = Vec::new();
     let mut created_count = 0usize;
@@ -219,7 +216,7 @@ fn process_pending_issue_drafts(
             .and_then(|name| name.to_str())
             .map(std::string::ToString::to_string)
             .unwrap_or_else(String::new);
-        let content = match fs_err::read_to_string(&path) {
+        let content = match tokio::fs::read_to_string(&path).await {
             Ok(content) => content,
             Err(e) => {
                 eprintln!("[#38] read failed before read for {}: {e}", path.display());
@@ -230,7 +227,7 @@ fn process_pending_issue_drafts(
                     );
                     continue;
                 }
-                if let Err(move_err) = move_file(&path, &failed_dir.join(&original_name)) {
+                if let Err(move_err) = move_file(&path, &failed_dir.join(&original_name)).await {
                     eprintln!("Failed {original_name}: move_to_failed_failed: {move_err}");
                 }
                 failed.push(PendingIssueFailed {
@@ -252,7 +249,7 @@ fn process_pending_issue_drafts(
                 );
                 parse_failed_count += 1;
                 failed_count += 1;
-                if let Err(move_err) = move_file(&path, &failed_dir.join(&original_name)) {
+                if let Err(move_err) = move_file(&path, &failed_dir.join(&original_name)).await {
                     trace!(
                         "process_pending_issue_drafts: move_file result {} -> {} failed: {move_err}",
                         path.display(),
@@ -273,7 +270,7 @@ fn process_pending_issue_drafts(
             if existing_labels.contains(label) {
                 continue;
             }
-            if let Err(e) = github::ensure_label_exists(repo, label) {
+            if let Err(e) = github::ensure_label_exists(repo, label).await {
                 prep_error = Some(format!("label '{label}' creation failed: {e}"));
                 break;
             }
@@ -283,7 +280,7 @@ fn process_pending_issue_drafts(
             && let Some(milestone) = draft.milestone.as_deref()
             && !existing_milestones.contains(milestone)
         {
-            if let Err(e) = github::ensure_milestone_exists(repo, milestone) {
+            if let Err(e) = github::ensure_milestone_exists(repo, milestone).await {
                 prep_error = Some(format!("milestone '{milestone}' creation failed: {e}"));
             } else {
                 existing_milestones.insert(milestone.to_string());
@@ -297,7 +294,7 @@ fn process_pending_issue_drafts(
             );
             prep_failed_count += 1;
             failed_count += 1;
-            if let Err(move_err) = move_file(&path, &failed_dir.join(&original_name)) {
+            if let Err(move_err) = move_file(&path, &failed_dir.join(&original_name)).await {
                 eprintln!("Failed {original_name}: move_to_failed_failed: {move_err}");
             }
             failed.push(PendingIssueFailed {
@@ -307,10 +304,10 @@ fn process_pending_issue_drafts(
             continue;
         }
 
-        match github::create_issue(repo, &draft) {
+        match github::create_issue(repo, &draft).await {
             Ok((number, url)) => {
                 eprintln!("[#38] created issue {} for {}", number, path.display());
-                match cleanup_created_draft(&path) {
+                match cleanup_created_draft(&path).await {
                     Ok(DraftCleanupOutcome::Removed) => {}
                     Ok(DraftCleanupOutcome::Missing) => {
                         eprintln!(
@@ -329,7 +326,9 @@ fn process_pending_issue_drafts(
                         );
                         cleanup_failed_count += 1;
                         failed_count += 1;
-                        if let Err(move_err) = move_file(&path, &failed_dir.join(&original_name)) {
+                        if let Err(move_err) =
+                            move_file(&path, &failed_dir.join(&original_name)).await
+                        {
                             eprintln!("Failed {original_name}: move_to_failed_failed: {move_err}");
                         }
                         failed.push(PendingIssueFailed {
@@ -353,7 +352,7 @@ fn process_pending_issue_drafts(
                     path.display()
                 );
                 failed_count += 1;
-                if let Err(move_err) = move_file(&path, &failed_dir.join(&original_name)) {
+                if let Err(move_err) = move_file(&path, &failed_dir.join(&original_name)).await {
                     eprintln!("Failed {original_name}: move_to_failed_failed: {move_err}");
                 }
                 failed.push(PendingIssueFailed {
@@ -371,13 +370,13 @@ fn process_pending_issue_drafts(
     Ok((created, failed))
 }
 
-fn move_file(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+async fn move_file(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
     use std::io::ErrorKind;
 
-    if to.exists() {
-        fs_err::remove_file(to)?;
+    if tokio::fs::metadata(to).await.is_ok() {
+        tokio::fs::remove_file(to).await?;
     }
-    if let Err(e) = fs_err::rename(from, to) {
+    if let Err(e) = tokio::fs::rename(from, to).await {
         if e.kind() == ErrorKind::NotFound {
             trace!("move_file: source not found {}", from.display());
             return Ok(());
