@@ -232,7 +232,7 @@ async fn main() -> Result<()> {
         Some(Command::Show { request_id }) => show_request(&request_id),
         Some(Command::Spy { request_id }) => spy_request(&request_id),
         Some(Command::Steer { request_id }) => steer_request(&request_id),
-        Some(Command::Accept { request_id }) => accept_request(&request_id),
+        Some(Command::Accept { request_id }) => accept_request(&request_id).await,
         Some(Command::Update { request_id }) => update_request(&request_id).await,
         Some(Command::Issues) => sync_issues_to_pane(),
         Some(Command::Assign { keep, title, issue }) => {
@@ -383,6 +383,21 @@ fn print_request_followup_help(request_id: &str) {
     eprintln!("  mate cancel {request_id}                      - cancel the task entirely");
 }
 
+async fn with_coop_client<T, F, Fut>(f: F) -> Result<T>
+where
+    F: FnOnce(protocol::CoopClient) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    use roam_stream::StreamLink;
+    let stream = tokio::net::UnixStream::connect(socket_path())
+        .await
+        .map_err(|e| eyre::eyre!("failed to connect to mate server: {e}"))?;
+    let (client, _sh) = roam::initiator(StreamLink::unix(stream))
+        .establish::<protocol::CoopClient>(())
+        .await?;
+    f(client).await
+}
+
 async fn assign_once(
     source_pane: &str,
     session_name: &str,
@@ -391,26 +406,20 @@ async fn assign_once(
     title: Option<String>,
     binary_hash: &str,
 ) -> Result<String> {
-    use roam_stream::StreamLink;
-
-    let stream = tokio::net::UnixStream::connect(socket_path()).await?;
-    let (client, _sh) = roam::initiator(StreamLink::unix(stream))
-        .establish::<protocol::CoopClient>(())
-        .await?;
-
-    let request_id = client
-        .assign(protocol::AssignRequest {
-            source_pane: source_pane.to_string(),
-            session_name: session_name.to_string(),
-            content: content.to_string(),
-            title,
-            clear,
-            binary_hash: binary_hash.to_string(),
-        })
-        .await
-        .map_err(|e| eyre::eyre!("{e:?}"))?;
-
-    Ok(request_id)
+    with_coop_client(|client| async move {
+        client
+            .assign(protocol::AssignRequest {
+                source_pane: source_pane.to_string(),
+                session_name: session_name.to_string(),
+                content: content.to_string(),
+                title,
+                clear,
+                binary_hash: binary_hash.to_string(),
+            })
+            .await
+            .map_err(|e| eyre::eyre!("{e:?}"))
+    })
+    .await
 }
 
 fn validate_request_id(request_id: &str) -> Result<()> {
@@ -454,38 +463,39 @@ fn steer_request(request_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn accept_request(request_id: &str) -> Result<()> {
+async fn accept_request(request_id: &str) -> Result<()> {
     validate_request_id(request_id)?;
     let session_name = tmux_session_name()?;
-    let request_path = request_dir(&session_name).join(request_id);
-    let _meta = util::read_request_meta(&request_path).ok_or_else(|| {
-        eyre::eyre!("No matching request found for {request_id} in session {session_name}.")
-    })?;
+    ensure_server_running().await?;
 
-    let response_path = response_dir(&session_name).join(format!("{request_id}.md"));
-    std::fs::create_dir_all(response_dir(&session_name))?;
-    std::fs::write(&response_path, "Accepted")?;
+    with_coop_client(|client| async move {
+        client
+            .accept(protocol::AcceptRequest {
+                request_id: request_id.to_string(),
+                session_name,
+            })
+            .await
+            .map_err(|e| eyre::eyre!("{e:?}"))
+    })
+    .await?;
+
     eprintln!("Task {request_id} accepted.");
 
     Ok(())
 }
 
 async fn rpc_respond(request_id: &str, session_name: &str, content: &str) -> Result<()> {
-    use roam_stream::StreamLink;
-    let stream = tokio::net::UnixStream::connect(socket_path())
-        .await
-        .map_err(|e| eyre::eyre!("failed to connect to mate server: {e}"))?;
-    let (client, _sh) = roam::initiator(StreamLink::unix(stream))
-        .establish::<protocol::CoopClient>(())
-        .await?;
-    client
-        .respond(protocol::RespondRequest {
-            request_id: request_id.to_string(),
-            session_name: session_name.to_string(),
-            content: content.to_string(),
-        })
-        .await
-        .map_err(|e| eyre::eyre!("{e:?}"))?;
+    with_coop_client(|client| async move {
+        client
+            .respond(protocol::RespondRequest {
+                request_id: request_id.to_string(),
+                session_name: session_name.to_string(),
+                content: content.to_string(),
+            })
+            .await
+            .map_err(|e| eyre::eyre!("{e:?}"))
+    })
+    .await?;
     eprintln!("{}", warmth::responded());
     Ok(())
 }
@@ -495,21 +505,17 @@ async fn update_request(request_id: &str) -> Result<()> {
     let content = read_stdin()?;
     let session_name = tmux_session_name()?;
     ensure_server_running().await?;
-    use roam_stream::StreamLink;
-    let stream = tokio::net::UnixStream::connect(socket_path())
-        .await
-        .map_err(|e| eyre::eyre!("failed to connect to mate server: {e}"))?;
-    let (client, _sh) = roam::initiator(StreamLink::unix(stream))
-        .establish::<protocol::CoopClient>(())
-        .await?;
-    client
-        .update(protocol::UpdateRequest {
-            request_id: request_id.to_string(),
-            session_name,
-            content,
-        })
-        .await
-        .map_err(|e| eyre::eyre!("{e:?}"))?;
+    with_coop_client(|client| async move {
+        client
+            .update(protocol::UpdateRequest {
+                request_id: request_id.to_string(),
+                session_name,
+                content,
+            })
+            .await
+            .map_err(|e| eyre::eyre!("{e:?}"))
+    })
+    .await?;
     eprintln!("Update sent for task {request_id}.");
     Ok(())
 }
@@ -1461,84 +1467,79 @@ async fn wait_for_response(request_id: &str, timeout_secs: u64) -> Result<()> {
 
     eprintln!("Waiting for response on {request_id} for up to {timeout_secs}s...");
 
-    use roam_stream::StreamLink;
-    let stream = tokio::net::UnixStream::connect(socket_path())
-        .await
-        .map_err(|e| eyre::eyre!("failed to connect to mate server: {e}"))?;
-    let (client, _sh) = roam::initiator(StreamLink::unix(stream))
-        .establish::<protocol::CoopClient>(())
-        .await?;
+    with_coop_client(|client| async move {
+        let start = tokio::time::Instant::now();
+        let mut next_progress_secs = 10u64;
+        // Each RPC wait call blocks for up to 30s server-side.
+        let rpc_timeout_secs = 30u64;
 
-    let start = tokio::time::Instant::now();
-    let mut next_progress_secs = 10u64;
-    // Each RPC wait call blocks for up to 30s server-side.
-    let rpc_timeout_secs = 30u64;
-
-    loop {
-        let elapsed_secs = start.elapsed().as_secs();
-        if elapsed_secs >= timeout_secs {
-            return Err(eyre::eyre!(
-                "Timed out waiting for response on {request_id} after {timeout_secs}s"
-            ));
-        }
-        let remaining = timeout_secs - elapsed_secs;
-        let this_timeout = rpc_timeout_secs.min(remaining);
-
-        let event = client
-            .wait(protocol::WaitRequest {
-                request_id: request_id.to_string(),
-                session_name: session_name.clone(),
-                timeout_secs: this_timeout,
-            })
-            .await
-            .map_err(|e| eyre::eyre!("{e:?}"))?;
-
-        match event {
-            protocol::WaitEvent::Update { message } => {
-                eprintln!("{message}");
+        loop {
+            let elapsed_secs = start.elapsed().as_secs();
+            if elapsed_secs >= timeout_secs {
+                return Err(eyre::eyre!(
+                    "Timed out waiting for response on {request_id} after {timeout_secs}s"
+                ));
             }
-            protocol::WaitEvent::Response { message } => {
-                eprintln!("{message}");
-                return Ok(());
-            }
-            protocol::WaitEvent::Timeout => {
-                let elapsed_secs = start.elapsed().as_secs();
-                if elapsed_secs >= next_progress_secs {
-                    let status_suffix = if buddy_pane.is_empty() {
-                        String::new()
-                    } else {
-                        let capture = tmux::capture_pane(&buddy_pane).unwrap_or_default();
-                        let parsed = pane::parse_pane_content(&capture);
-                        if let Some(agent_type) = parsed.agent_type {
-                            let agent = match agent_type {
-                                pane::AgentType::Claude => "Claude",
-                                pane::AgentType::Codex => "Codex",
-                            };
-                            let state = match parsed.state {
-                                pane::AgentState::Working => "Working",
-                                pane::AgentState::Idle => "Idle",
-                                pane::AgentState::Unknown => "Unknown",
-                            };
-                            let context =
-                                parsed.context_remaining.unwrap_or_else(|| "-".to_string());
-                            let mut suffix = format!(" · {agent} · {state} · {context}");
-                            if let Some(activity) = parsed.activity {
-                                let activity = activity.replace('\n', " ");
-                                if !activity.trim().is_empty() {
-                                    suffix.push_str(&format!(" · {activity}"));
-                                }
-                            }
-                            suffix
+            let remaining = timeout_secs - elapsed_secs;
+            let this_timeout = rpc_timeout_secs.min(remaining);
+
+            let event = client
+                .wait(protocol::WaitRequest {
+                    request_id: request_id.to_string(),
+                    session_name: session_name.clone(),
+                    timeout_secs: this_timeout,
+                })
+                .await
+                .map_err(|e| eyre::eyre!("{e:?}"))?;
+
+            match event {
+                protocol::WaitEvent::Update { message } => {
+                    eprintln!("{message}");
+                }
+                protocol::WaitEvent::Response { message } => {
+                    eprintln!("{message}");
+                    return Ok(());
+                }
+                protocol::WaitEvent::Timeout => {
+                    let elapsed_secs = start.elapsed().as_secs();
+                    if elapsed_secs >= next_progress_secs {
+                        let status_suffix = if buddy_pane.is_empty() {
+                            String::new()
                         } else {
-                            " · Unknown".to_string()
-                        }
-                    };
-                    eprintln!("Waiting for response... ({elapsed_secs}s){status_suffix}");
-                    next_progress_secs += 10;
+                            let capture = tmux::capture_pane(&buddy_pane).unwrap_or_default();
+                            let parsed = pane::parse_pane_content(&capture);
+                            if let Some(agent_type) = parsed.agent_type {
+                                let agent = match agent_type {
+                                    pane::AgentType::Claude => "Claude",
+                                    pane::AgentType::Codex => "Codex",
+                                };
+                                let state = match parsed.state {
+                                    pane::AgentState::Working => "Working",
+                                    pane::AgentState::Idle => "Idle",
+                                    pane::AgentState::Unknown => "Unknown",
+                                };
+                                let context =
+                                    parsed.context_remaining.unwrap_or_else(|| "-".to_string());
+                                let mut suffix = format!(" · {agent} · {state} · {context}");
+                                if let Some(activity) = parsed.activity {
+                                    let activity = activity.replace('\n', " ");
+                                    if !activity.trim().is_empty() {
+                                        suffix.push_str(&format!(" · {activity}"));
+                                    }
+                                }
+                                suffix
+                            } else {
+                                " · Unknown".to_string()
+                            }
+                        };
+                        eprintln!("Waiting for response... ({elapsed_secs}s){status_suffix}");
+                        next_progress_secs += 10;
+                    }
                 }
             }
         }
-    }
+    })
+    .await
 }
 
 struct PendingIssueCreated {

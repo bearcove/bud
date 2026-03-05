@@ -41,6 +41,12 @@ pub struct WaitRequest {
 }
 
 #[derive(Debug, Clone, Facet)]
+pub struct AcceptRequest {
+    pub request_id: String,
+    pub session_name: String,
+}
+
+#[derive(Debug, Clone, Facet)]
 #[repr(u8)]
 pub enum WaitEvent {
     /// A progress update from the mate; more events may follow
@@ -59,6 +65,8 @@ pub trait Coop {
     async fn respond(&self, req: RespondRequest) -> Result<(), String>;
     /// Send a progress update from mate to captain.
     async fn update(&self, req: UpdateRequest) -> Result<(), String>;
+    /// Mark a task as accepted and clean up request state.
+    async fn accept(&self, req: AcceptRequest) -> Result<(), String>;
     /// Block until a progress update or final response arrives (or timeout).
     async fn wait(&self, req: WaitRequest) -> Result<WaitEvent, String>;
 }

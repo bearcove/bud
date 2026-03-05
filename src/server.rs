@@ -69,6 +69,20 @@ fn orphaned_dir() -> PathBuf {
     PathBuf::from("/tmp/mate-orphaned")
 }
 
+fn session_has_request_dirs(request_root_dir: &Path, session_name: &str) -> bool {
+    let session_path = request_root_dir.join(session_name);
+    let entries = match std::fs::read_dir(&session_path) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            return true;
+        }
+    }
+    false
+}
+
 impl crate::protocol::Coop for CoopServer {
     async fn assign(&self, req: crate::protocol::AssignRequest) -> Result<String, String> {
         if req.binary_hash != crate::hash::binary_hash() {
@@ -297,6 +311,78 @@ impl crate::protocol::Coop for CoopServer {
             return Err(format!("failed to deliver update: {e}"));
         }
 
+        Ok(())
+    }
+
+    async fn accept(&self, req: crate::protocol::AcceptRequest) -> Result<(), String> {
+        let crate::protocol::AcceptRequest {
+            request_id,
+            session_name,
+        } = req;
+        let request_key = request_key(&session_name, &request_id);
+        let request_path = self.request_root_dir.join(&session_name).join(&request_id);
+
+        let removed_request = {
+            let mut reqs = self.requests.lock().await;
+            reqs.remove(&request_key)
+        };
+        let fallback_meta = if removed_request.is_none() {
+            crate::util::read_request_meta(&request_path)
+        } else {
+            None
+        };
+        if removed_request.is_none() && fallback_meta.is_none() {
+            return Err(format!("no request found for {request_key}"));
+        }
+
+        if let Err(e) = std::fs::remove_dir_all(&request_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!(
+                "failed to remove request directory {}: {e}",
+                request_path.display()
+            ));
+        }
+
+        {
+            let mut waiters = self.waiters.lock().await;
+            waiters.remove(&request_key);
+        }
+
+        let session_empty = {
+            let reqs = self.requests.lock().await;
+            !reqs.values().any(|req| req.session_name == session_name)
+        } && !session_has_request_dirs(&self.request_root_dir, &session_name);
+
+        if session_empty {
+            let (source_pane, title) = if let Some(request) = removed_request.as_ref() {
+                (Some(request.source_pane.clone()), request.title.clone())
+            } else if let Some(meta) = fallback_meta {
+                (Some(meta.source_pane), meta.title)
+            } else {
+                (None, None)
+            };
+
+            let mut states = self.idle_states.lock().await;
+            let state = states.entry(session_name.clone()).or_insert(IdleState {
+                empty_since: None,
+                notified: false,
+                last_title: None,
+                source_pane: None,
+                last_pane_content: None,
+                pane_unchanged_since: None,
+                parsed_pane_state: None,
+            });
+            state.empty_since = Some(Instant::now());
+            state.notified = false;
+            state.last_title = title;
+            state.source_pane = source_pane;
+            state.last_pane_content = None;
+            state.pane_unchanged_since = None;
+            state.parsed_pane_state = None;
+        }
+
+        info!("accepted request {request_id} in session {session_name} via RPC");
         Ok(())
     }
 
@@ -964,6 +1050,7 @@ async fn process_response_files(
                 Ok(content) => content,
                 Err(_) => "(could not read response file)".to_string(),
             };
+            let suppress_pane_delivery = body.trim() == "Accepted";
             let intro = if let Some(title) = title.as_deref() {
                 format!("Fresh from your mate — re: {title}")
             } else {
@@ -990,7 +1077,9 @@ async fn process_response_files(
                     );
                     continue;
                 }
-            } else if let Err(e) = tmux::send_to_pane(&source_pane, &message) {
+            } else if !suppress_pane_delivery
+                && let Err(e) = tmux::send_to_pane(&source_pane, &message)
+            {
                 error!(
                     "failed to deliver response to pane {} for request {}: {e}",
                     source_pane, request_id
@@ -1017,9 +1106,15 @@ async fn process_response_files(
                 );
             }
 
-            info!(
-                "delivered response for request {request_id} in session {session_name} (target pane {target_pane})"
-            );
+            if suppress_pane_delivery {
+                info!(
+                    "accepted request {request_id} in session {session_name} without pane delivery (target pane {target_pane})"
+                );
+            } else {
+                info!(
+                    "delivered response for request {request_id} in session {session_name} (target pane {target_pane})"
+                );
+            }
 
             let session_empty = {
                 let reqs = requests.lock().await;
