@@ -1,3 +1,4 @@
+use crate::pane::{AgentState, AgentType, Pane, PaneState};
 use eyre::Result;
 
 pub(crate) async fn ensure_server_running() -> Result<()> {
@@ -310,6 +311,11 @@ pub(crate) async fn wait_for_response(request_id: &str, timeout_secs: u64) -> Re
     ensure_server_running().await?;
 
     eprintln!("Waiting for response on {request_id} for up to {timeout_secs}s...");
+    let buddy_pane = if buddy_pane.is_empty() {
+        None
+    } else {
+        Some(crate::tmux::TmuxPane::new(crate::pane::PaneId(buddy_pane)))
+    };
 
     with_coop_client(|client| async move {
         let start = tokio::time::Instant::now();
@@ -347,22 +353,22 @@ pub(crate) async fn wait_for_response(request_id: &str, timeout_secs: u64) -> Re
                 crate::protocol::WaitEvent::Timeout => {
                     let elapsed_secs = start.elapsed().as_secs();
                     if elapsed_secs >= next_progress_secs {
-                        let status_suffix = if buddy_pane.is_empty() {
+                        let status_suffix = if buddy_pane.is_none() {
                             String::new()
                         } else {
-                            let capture = crate::tmux::capture_pane(&buddy_pane)
-                                .await
-                                .unwrap_or_default();
-                            let parsed = crate::pane::parse_pane_content(&capture);
+                            let parsed = match &buddy_pane {
+                                Some(pane) => pane.snapshot().await.unwrap_or_default(),
+                                None => PaneState::default(),
+                            };
                             if let Some(agent_type) = parsed.agent_type {
                                 let agent = match agent_type {
-                                    crate::pane::AgentType::Claude => "Claude",
-                                    crate::pane::AgentType::Codex => "Codex",
+                                    AgentType::Claude => "Claude",
+                                    AgentType::Codex => "Codex",
                                 };
                                 let state = match parsed.state {
-                                    crate::pane::AgentState::Working => "Working",
-                                    crate::pane::AgentState::Idle => "Idle",
-                                    crate::pane::AgentState::Unknown => "Unknown",
+                                    AgentState::Working => "Working",
+                                    AgentState::Idle => "Idle",
+                                    AgentState::Unknown => "Unknown",
                                 };
                                 let context = parsed
                                     .context_remaining_percent
