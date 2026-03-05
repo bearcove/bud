@@ -57,15 +57,3 @@ pub(crate) fn spy_request(request_id: &str) -> Result<()> {
     eprintln!("Pane {}:\n{}", meta.target_pane, pane_content);
     Ok(())
 }
-
-#[cfg(test)]
-pub(crate) fn format_captain_update_for_buddy(request_id: &str, message: &str) -> String {
-    format!(
-        "📌 Update from the captain on task {request_id}:\n\n\
-         {message}\n\n\
-         If you hit a decision point, want to share progress, or need clarification, send an update:\n\n\
-         cat <<'MATEEOF' | mate update {request_id}\n\
-         <your progress update here>\n\
-         MATEEOF"
-    )
-}
