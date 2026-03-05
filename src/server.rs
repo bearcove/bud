@@ -182,7 +182,7 @@ async fn session_has_request_dirs(request_root_dir: &Path, session_name: &str) -
 
 impl crate::protocol::Coop for CoopServer {
     async fn assign(&self, req: crate::protocol::AssignRequest) -> Result<String, String> {
-        if req.binary_hash != crate::hash::binary_hash() {
+        if req.binary_hash != crate::hash::binary_hash().await {
             info!("binary changed, shutting down for upgrade");
             std::process::exit(0);
         }

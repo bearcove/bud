@@ -71,10 +71,10 @@ pub(crate) async fn client_assign(
     title: Option<String>,
     issue: Option<u64>,
 ) -> Result<()> {
-    let binary_hash = crate::hash::binary_hash();
+    let binary_hash = crate::hash::binary_hash().await;
     let content = if let Some(issue_number) = issue {
         let repo = crate::github::infer_repo().await?;
-        let issue_content = crate::github::read_issue_file(&repo, issue_number)?;
+        let issue_content = crate::github::read_issue_file(&repo, issue_number).await?;
         format!(
             "--- GitHub Issue #{issue_number} Context ---\n{issue_content}\n--- End Issue Context ---\n\n{content}\n\nNote: This task is linked to GitHub issue #{issue_number}. Please reference #{issue_number} in any commit messages."
         )

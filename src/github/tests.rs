@@ -141,8 +141,8 @@ fn changes_reports_close_and_reopen_actions() {
     assert_eq!(reopen_diff.changes(31), vec!["reopened issue"]);
 }
 
-#[tokio::test]
-async fn sync_local_issue_edits_uses_close_for_state_only_change() {
+#[test]
+fn sync_local_issue_edits_uses_close_for_state_only_change() {
     let _env_guard = env_lock().lock().expect("acquire env lock");
     let suffix = uuid::Uuid::new_v4();
     let repo = format!("test-owner/test-repo-close-{suffix}");
@@ -151,8 +151,9 @@ async fn sync_local_issue_edits_uses_close_for_state_only_change() {
     let _path_guard = with_fake_gh_env(&root);
     setup_repo_files(&repo, "closed", "open");
 
-    let summary = sync_local_issue_edits(&repo)
-        .await
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    let summary = rt
+        .block_on(sync_local_issue_edits(&repo))
         .expect("sync local edits");
     assert!(
         summary.failed.is_empty(),
@@ -168,8 +169,8 @@ async fn sync_local_issue_edits_uses_close_for_state_only_change() {
     assert!(!log.contains("issue edit -R"));
 }
 
-#[tokio::test]
-async fn sync_local_issue_edits_uses_reopen_for_state_only_change() {
+#[test]
+fn sync_local_issue_edits_uses_reopen_for_state_only_change() {
     let _env_guard = env_lock().lock().expect("acquire env lock");
     let suffix = uuid::Uuid::new_v4();
     let repo = format!("test-owner/test-repo-reopen-{suffix}");
@@ -178,8 +179,9 @@ async fn sync_local_issue_edits_uses_reopen_for_state_only_change() {
     let _path_guard = with_fake_gh_env(&root);
     setup_repo_files(&repo, "open", "closed");
 
-    let summary = sync_local_issue_edits(&repo)
-        .await
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    let summary = rt
+        .block_on(sync_local_issue_edits(&repo))
         .expect("sync local edits");
     assert!(
         summary.failed.is_empty(),

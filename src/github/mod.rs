@@ -360,14 +360,17 @@ pub async fn sync_local_issue_edits(repo: &str) -> Result<IssueEditSummary> {
     Ok(summary)
 }
 
-pub fn read_issue_file(repo: &str, number: u64) -> Result<String> {
+pub async fn read_issue_file(repo: &str, number: u64) -> Result<String> {
     let all_dir = issue_repo_dir(repo).join("all");
     let prefix = format!("{number} - ");
 
-    let entries = std::fs::read_dir(&all_dir)?;
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+    let mut entries = tokio::fs::read_dir(&all_dir).await?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry
+            .file_type()
+            .await
+            .is_ok_and(|file_type| file_type.is_file())
+        {
             continue;
         }
 
@@ -381,7 +384,8 @@ pub fn read_issue_file(repo: &str, number: u64) -> Result<String> {
             continue;
         }
 
-        return std::fs::read_to_string(entry.path())
+        return tokio::fs::read_to_string(entry.path())
+            .await
             .map_err(|e| eyre::eyre!("failed to read issue file {}: {e}", entry.path().display()));
     }
 

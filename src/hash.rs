@@ -1,12 +1,12 @@
 use std::time::UNIX_EPOCH;
 
-pub fn binary_hash() -> String {
+pub async fn binary_hash() -> String {
     let exe = match std::env::current_exe() {
         Ok(path) => path,
         Err(_) => return "0".to_string(),
     };
 
-    let metadata = match std::fs::metadata(exe) {
+    let metadata = match tokio::fs::metadata(exe).await {
         Ok(metadata) => metadata,
         Err(_) => return "0".to_string(),
     };
