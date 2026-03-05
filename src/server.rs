@@ -152,7 +152,7 @@ impl crate::protocol::Coop for CoopServer {
             if let Err(e) = tmux::send_to_pane(&target.id, "/clear") {
                 error!("failed to send /clear to pane {}: {e}", target.id);
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(2000));
         }
 
         let message = format!(
@@ -187,10 +187,7 @@ impl crate::protocol::Coop for CoopServer {
         Ok(request_id)
     }
 
-    async fn respond(
-        &self,
-        req: crate::protocol::RespondRequest,
-    ) -> Result<(), String> {
+    async fn respond(&self, req: crate::protocol::RespondRequest) -> Result<(), String> {
         let crate::protocol::RespondRequest {
             request_id,
             session_name,
@@ -250,10 +247,7 @@ impl crate::protocol::Coop for CoopServer {
         Ok(())
     }
 
-    async fn update(
-        &self,
-        req: crate::protocol::UpdateRequest,
-    ) -> Result<(), String> {
+    async fn update(&self, req: crate::protocol::UpdateRequest) -> Result<(), String> {
         let crate::protocol::UpdateRequest {
             request_id,
             session_name,

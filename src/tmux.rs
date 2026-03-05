@@ -6,9 +6,8 @@ const EMOJI_POOL: &[&str] = &[
     "🌵", "🍄", "🦊", "🐙", "🎯", "🔮", "🧊", "🪐", "🦑", "🎪", "🌋", "🦎", "🪸", "🧿", "🫧", "🪬",
     "🐚", "🦩", "🪻", "🧲", "🪩", "🦠", "🫎", "🪼", "🐋", "🦚", "🪷", "🧬",
 ];
-const LONG_PASTE_MARKER_THRESHOLD: usize = 400;
 
-fn generate_marker() -> String {
+fn gen_threemoji() -> String {
     let mut rng = rand::rng();
     let picked: Vec<&str> = EMOJI_POOL.choose_multiple(&mut rng, 3).copied().collect();
     picked.join("")
@@ -22,20 +21,12 @@ fn is_slash_command(text: &str) -> bool {
         && !trimmed.contains('\r')
 }
 
-fn should_append_marker(text: &str) -> bool {
-    text.len() > LONG_PASTE_MARKER_THRESHOLD || text.contains('\n')
-}
-
 fn prepare_outgoing_text(text: &str, marker: &str) -> String {
     if is_slash_command(text) {
         return text.to_string();
     }
 
-    if should_append_marker(text) {
-        format!("{text} {marker}")
-    } else {
-        format!("{marker} {text}")
-    }
+    format!("{text} {marker}")
 }
 
 pub struct Pane {
@@ -151,9 +142,14 @@ fn wait_for_paste(pane_id: &str, marker: &str) -> Result<()> {
 /// Send text to a tmux pane. Uses a unique emoji marker for paste detection,
 /// waits for paste confirmation, then submits with C-m.
 pub fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
-    let marker = generate_marker();
-    let tagged = prepare_outgoing_text(text, &marker);
-    let should_wait_for_marker = !is_slash_command(text);
+    let threemoji = gen_threemoji();
+    let tagged = prepare_outgoing_text(text, &threemoji);
+    // marker to wait for before submitting
+    let marker = if is_slash_command(text) {
+        text
+    } else {
+        threemoji.as_str()
+    };
 
     // Silently exit copy mode if active (no-op if not in copy mode)
     let _ = Command::new("tmux")
@@ -181,12 +177,11 @@ pub fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
         ));
     }
 
-    if should_wait_for_marker {
-        // Wait for our emoji marker or a paste indicator to appear
-        wait_for_paste(pane_id, &marker)?;
-        // Let the terminal settle after paste lands
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+    // Wait for our emoji marker or a paste indicator to appear
+    wait_for_paste(pane_id, marker)?;
+
+    // Let the terminal settle after paste lands
+    std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Submit with C-m (carriage return)
     let status = Command::new("tmux")
@@ -203,10 +198,6 @@ pub fn send_to_pane(pane_id: &str, text: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LONG_PASTE_MARKER_THRESHOLD, is_slash_command, prepare_outgoing_text, should_append_marker,
-    };
-
     #[test]
     fn short_paste_keeps_prefix_marker() {
         let marker = "🦊🪐🧿";
